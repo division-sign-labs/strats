@@ -1,12 +1,12 @@
 // strats close: cancel our exits by id and close the position with a reduce-only order, after a y/N confirm.
-import type { Args } from "../args.js";
+import { UsageError, type Args } from "../args.js";
 import { fetchTarget, fetchTeamTargets } from "../client.js";
 import { sourceFor } from "../polymarket-source.js";
 import { dexOfCoin, type ThemeMarket } from "../protocol/index.js";
 import { px, usd } from "../reconcile.js";
 import { loadAgentKey, loadPolymarketCreds, openSession, scrub, sessionSecrets, type Session } from "../session.js";
 import type { Prompts } from "../setup.js";
-import { isPolymarketBot } from "../state.js";
+import { isPolymarketBot, isTwoVenueBot } from "../state.js";
 import { teamMarketsForCycle } from "../team-markets.js";
 import { Venue } from "../venue.js";
 import { PolymarketVenue, polymarketGeoblock } from "../venue-polymarket.js";
@@ -17,6 +17,7 @@ async function closableMarkets(session: Session): Promise<{ ok: true; markets: T
   const config = await source.fetchConfig(session.gateway);
   if (!config.ok) return { ok: false, message: `Could not read the ${source.strategyId === "team" ? "settings" : "configured markets"}. ${config.message}` };
   if (config.value.config.strategyId === "theme") return { ok: true, markets: config.value.config.strategy.markets };
+  if (config.value.config.strategyId === "stock-ls") return { ok: true, markets: config.value.config.strategy.markets ?? [] };
   // A team bot has no list of its own: its markets are the team's games, named by the targets document.
   const targets = await fetchTeamTargets(session.gateway);
   if (!targets.ok) return { ok: false, message: `Could not read the team's games. ${targets.message}` };
@@ -24,7 +25,7 @@ async function closableMarkets(session: Session): Promise<{ ok: true; markets: T
   return { ok: true, markets: teamMarketsForCycle({ ...targets.value, targets: [] }, config.value.config.strategy).markets };
 }
 
-/** Theme and team bots: sell every position in one of the bot's markets at the bid. Positions in other markets are left alone. */
+/** Sell every Polymarket position in one of the bot's markets at the bid. Positions in other markets are left alone. */
 async function closeTheme(session: Session, prompts: Prompts): Promise<number> {
   const { bot } = session;
   if (!bot.polymarket) throw new Error("This bot has no Polymarket account yet.");
@@ -83,7 +84,11 @@ async function closeTheme(session: Session, prompts: Prompts): Promise<number> {
 export async function close(args: Args, prompts: Prompts): Promise<number> {
   const session = await openSession(args, prompts);
   const { bot } = session;
-  if (isPolymarketBot(bot)) return closeTheme(session, prompts);
+  const venueFlag = args.values.venue;
+  if (venueFlag !== undefined && venueFlag !== "hyperliquid" && venueFlag !== "polymarket") throw new UsageError("--venue takes hyperliquid or polymarket.");
+  if (venueFlag !== undefined && !isTwoVenueBot(bot)) throw new UsageError("--venue applies to a single-asset bot that also trades Polymarket markets. This bot has one venue.");
+  if (isPolymarketBot(bot) || venueFlag === "polymarket") return closeTheme(session, prompts);
+  if (isTwoVenueBot(bot)) console.log("This closes the perp. To sell the Polymarket positions: strats close --venue polymarket");
   const agentPk = loadAgentKey(session);
 
   // The target names the coin. --coin covers the case where the gateway cannot be reached and you still want out.

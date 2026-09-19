@@ -1,15 +1,16 @@
 // strats fund: move USDC from Arbitrum into Hyperliquid and approve a trading
 // key. This is the only command that reads the master key. Everything it signs
 // is signed on this machine by the cassie-core funding flow. strats init runs
-// the same code as its funding step.
-import type { Args } from "../args.js";
+// the same code as its funding step. A single-asset bot that also trades markets
+// has two funding steps, one per venue; --venue polymarket names the second.
+import { UsageError, type Args } from "../args.js";
 import { fetchTarget } from "../client.js";
 import { isFunded } from "../install.js";
 import { loadRuntimeState, saveRuntimeState } from "../runtime-state.js";
 import type { PolymarketCreds } from "../runtime-creds.js";
-import { loadPolymarketCreds, openSession, requireKeystore, type KeystoreSession } from "../session.js";
+import { loadPolymarketCreds, openSession, polymarketSignerRole, requireKeystore, type KeystoreSession } from "../session.js";
 import { makeSetupContext, type Prompts } from "../setup.js";
-import { isPolymarketBot, saveBot } from "../state.js";
+import { isPolymarketBot, isTwoVenueBot, marketsStateScope, saveBot } from "../state.js";
 import { buildAdapter } from "../venue.js";
 import { buildPolymarketAdapter } from "../venue-polymarket.js";
 
@@ -19,6 +20,8 @@ const ALREADY_FUNDED_USD = 1;
 export interface FundOptions {
   /** True when strats init calls this as its funding step: init says what comes next. */
   chained?: boolean;
+  /** A two-venue bot only: which venue to fund. Without it the perp is funded, as for any single-asset bot. */
+  venue?: "hyperliquid" | "polymarket";
 }
 
 function sayHowToStop(prompts: Prompts, chained: boolean): void {
@@ -28,9 +31,11 @@ function sayHowToStop(prompts: Prompts, chained: boolean): void {
   console.log("");
 }
 
-/** Theme and team bots: show the deposit address, wait for the credit, and verify the trading approvals. */
+/** Show the Polymarket deposit address, wait for the credit, and verify the trading approvals. */
 async function fundPolymarket(session: KeystoreSession, prompts: Prompts, opts: FundOptions): Promise<number> {
   const { bot } = session;
+  const twoVenue = isTwoVenueBot(bot);
+  const scope = marketsStateScope(bot);
   if (!bot.polymarket) {
     console.log("This bot has no Polymarket account yet. Run: strats init");
     return 1;
@@ -51,36 +56,42 @@ async function fundPolymarket(session: KeystoreSession, prompts: Prompts, opts: 
   const read = async (): Promise<number | undefined> => (await adapter.balances(acct).catch(() => []))[0]?.total;
   const before = creds ? await read() : undefined;
   // A setup that was stopped after the deposit arrived must not wait for a second one.
-  const skipDepositWait = !isFunded(bot) && before !== undefined && before >= ALREADY_FUNDED_USD;
+  const fundedBefore = twoVenue ? bot.markets?.fundedAt !== undefined : isFunded(bot);
+  const skipDepositWait = !fundedBefore && before !== undefined && before >= ALREADY_FUNDED_USD;
   if (skipDepositWait) console.log(`The deposit wallet already holds ${before!.toFixed(2)} pUSD, so this does not wait for another deposit. It checks the trading approvals.`);
   else sayHowToStop(prompts, opts.chained === true);
-  await adapter.runFundingFlow(makeSetupContext(bot.id, session.keystore, session.passphrase, prompts, { skipDepositWait }), acct);
+  await adapter.runFundingFlow(makeSetupContext(bot.id, session.keystore, session.passphrase, prompts, { skipDepositWait, masterRole: polymarketSignerRole(bot) }), acct);
   const after = await read();
   if (after !== undefined) {
     // Profit is measured against what was deposited. Polymarket has no deposit history to read, so it is recorded here.
-    const state = loadRuntimeState(bot.id);
+    const state = loadRuntimeState(bot.id, scope);
     const arrived = before !== undefined ? Math.max(0, after - before) : 0;
-    if (state.netDepositsUsd === undefined) saveRuntimeState(bot.id, { ...state, netDepositsUsd: after, netDepositsAt: new Date().toISOString() });
-    else if (arrived > 0.01) saveRuntimeState(bot.id, { ...state, netDepositsUsd: state.netDepositsUsd + arrived });
+    if (state.netDepositsUsd === undefined) saveRuntimeState(bot.id, { ...state, netDepositsUsd: after, netDepositsAt: new Date().toISOString() }, scope);
+    else if (arrived > 0.01) saveRuntimeState(bot.id, { ...state, netDepositsUsd: state.netDepositsUsd + arrived }, scope);
     console.log(`Deposit wallet balance: ${after.toFixed(2)} pUSD.`);
   }
-  session.bot = { ...bot, fundedAt: new Date().toISOString() };
+  // A two-venue bot records this step on its own, so the perp's funding step is never taken for it.
+  session.bot = twoVenue ? { ...bot, markets: { fundedAt: new Date().toISOString() } } : { ...bot, fundedAt: new Date().toISOString() };
   saveBot(session.bot);
   if (opts.chained) return 0;
   console.log("");
+  if (twoVenue && bot.deployment) console.log("The droplet trades the markets once it has the Polymarket credentials. To send them: strats deploy");
   console.log("Next: strats run --dry-run --once   (shows what it would do, sends nothing)");
   console.log("Then: strats deploy   (or strats run, from a location where Polymarket accepts orders)");
   return 0;
 }
 
 export async function fund(args: Args, prompts: Prompts): Promise<number> {
-  return fundSession(requireKeystore(await openSession(args, prompts), "fund"), args, prompts);
+  const venue = args.values.venue;
+  if (venue !== undefined && venue !== "hyperliquid" && venue !== "polymarket") throw new UsageError("--venue takes hyperliquid or polymarket.");
+  return fundSession(requireKeystore(await openSession(args, prompts), "fund"), args, prompts, venue ? { venue } : {});
 }
 
 /** The funding step itself, for a session that is already open. It records the result in the bot file and in `session.bot`. */
 export async function fundSession(session: KeystoreSession, args: Args, prompts: Prompts, opts: FundOptions = {}): Promise<number> {
   const { bot } = session;
-  if (isPolymarketBot(bot)) return fundPolymarket(session, prompts, opts);
+  if (opts.venue !== undefined && !isTwoVenueBot(bot)) throw new UsageError("--venue applies to a single-asset bot that also trades Polymarket markets. This bot has one venue.");
+  if (isPolymarketBot(bot) || opts.venue === "polymarket") return fundPolymarket(session, prompts, opts);
 
   // The asset decides the venue account: main-dex coins trade from the main account, HIP-3 coins from their own dex.
   let dex = args.values.dex === "main" ? "" : args.values.dex;
@@ -122,6 +133,7 @@ export async function fundSession(session: KeystoreSession, args: Args, prompts:
   }
   if (opts.chained) return 0;
   console.log("");
+  if (isTwoVenueBot(bot) && bot.markets?.fundedAt === undefined) console.log("Polymarket is not funded yet, so the bot trades the perp only. To fund it: strats fund --venue polymarket");
   console.log("Next: strats run --dry-run --once   (shows what it would do, sends nothing)");
   console.log("Then: strats deploy   (or strats run, to run it on this machine)");
   return 0;

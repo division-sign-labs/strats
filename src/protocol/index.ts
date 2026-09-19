@@ -38,22 +38,12 @@ export const AccountSchema = z.object({
   split: SplitSchema,
 });
 
-export const ConfigDocSchema = z.object({
-  strategyId: z.literal(STRATEGY_ID),
-  version: z.number().int().nonnegative(),
-  updatedAt: isoTime,
-  config: z.object({
-    v: z.literal(PROTOCOL_VERSION),
-    strategyId: z.literal(STRATEGY_ID),
-    strategy: z.object({ assetKey: z.string().min(1), direction: z.enum(["both", "long", "short"]).optional() }),
-    account: AccountSchema,
-    profile: optionalProfile,
-  }),
-});
-
 const tokenPair = z.tuple([z.string().min(1), z.string().min(1)]);
 
-/** One Polymarket market the creator chose. `side` is the index of the outcome the theme buys. */
+/**
+ * One Polymarket market the creator chose. `side` is the index of the outcome the theme buys.
+ * On a single-asset key it is the outcome that is good for someone long the asset.
+ */
 export const ThemeMarketSchema = z.object({
   conditionId: z.string().min(1),
   tokenIds: tokenPair,
@@ -63,6 +53,26 @@ export const ThemeMarketSchema = z.object({
   marketKey: z.string().nullable(),
 });
 
+export const MAX_CONFIGURED_MARKETS = 40;
+
+export const ConfigDocSchema = z.object({
+  strategyId: z.literal(STRATEGY_ID),
+  version: z.number().int().nonnegative(),
+  updatedAt: isoTime,
+  config: z.object({
+    v: z.literal(PROTOCOL_VERSION),
+    strategyId: z.literal(STRATEGY_ID),
+    strategy: z.object({
+      assetKey: z.string().min(1),
+      direction: z.enum(["both", "long", "short"]).optional(),
+      /** The asset's Polymarket markets, chosen on TokenStrats. Absent or empty means the bot trades the perp only. */
+      markets: z.array(ThemeMarketSchema).max(MAX_CONFIGURED_MARKETS).optional(),
+    }),
+    account: AccountSchema,
+    profile: optionalProfile,
+  }),
+});
+
 export const ThemeConfigDocSchema = z.object({
   strategyId: z.literal(THEME_STRATEGY_ID),
   version: z.number().int().nonnegative(),
@@ -70,7 +80,7 @@ export const ThemeConfigDocSchema = z.object({
   config: z.object({
     v: z.literal(PROTOCOL_VERSION),
     strategyId: z.literal(THEME_STRATEGY_ID),
-    strategy: z.object({ thesis: z.string().min(3).max(600), markets: z.array(ThemeMarketSchema).min(1).max(40) }),
+    strategy: z.object({ thesis: z.string().min(3).max(600), markets: z.array(ThemeMarketSchema).min(1).max(MAX_CONFIGURED_MARKETS) }),
     account: AccountSchema,
     profile: optionalProfile,
   }),
@@ -165,6 +175,12 @@ export const TeamTargetsSchema = ThemeTargetsSchema.extend({
   markets: z.array(TeamMarketSchema).max(60),
 });
 
+/**
+ * The targets for a single-asset key's Polymarket markets: the theme document under the single-asset id.
+ * The literal id keeps this runner from taking a theme or team document for it, and the reverse.
+ */
+export const AssetMarketsTargetsSchema = ThemeTargetsSchema.extend({ strategyId: z.literal(STRATEGY_ID) });
+
 /** The report body limit on the gateway, in bytes. A larger report is dropped here rather than sent. */
 export const REPORT_MAX_BYTES = 24 * 1024;
 export const REPORT_MAX_POSITIONS = 20;
@@ -252,6 +268,7 @@ export type TeamConfigDoc = z.infer<typeof TeamConfigDocSchema>;
 export type TeamStrategy = z.infer<typeof TeamStrategySchema>;
 export type TeamMarket = z.infer<typeof TeamMarketSchema>;
 export type TeamTargetsDoc = z.infer<typeof TeamTargetsSchema>;
+export type AssetMarketsTargetsDoc = z.infer<typeof AssetMarketsTargetsSchema>;
 export type AnyConfigDoc = ConfigDoc | ThemeConfigDoc | TeamConfigDoc;
 export type ThemeMarket = z.infer<typeof ThemeMarketSchema>;
 export type ThemeTarget = z.infer<typeof ThemeTargetSchema>;
@@ -281,21 +298,34 @@ export function encodeReport(input: unknown): ParseResult<string> {
   return { ok: true, value: body };
 }
 
+/** The rules a list of configured markets must satisfy beyond its fields: two different tokens, and each market once. Null means they hold. */
+function configuredMarketsProblem(markets: readonly ThemeMarket[]): string | null {
+  const seen = new Set<string>();
+  for (const market of markets) {
+    if (market.tokenIds[0] === market.tokenIds[1]) return `market ${market.conditionId}: the two token ids are the same`;
+    if (seen.has(market.conditionId)) return `market ${market.conditionId} is listed twice`;
+    seen.add(market.conditionId);
+  }
+  return null;
+}
+
 export function parseConfig(input: unknown): ParseResult<ConfigDoc> {
   const parsed = ConfigDocSchema.safeParse(input);
-  return parsed.success ? { ok: true, value: parsed.data } : { ok: false, reason: describe(parsed.error) };
+  if (!parsed.success) return { ok: false, reason: describe(parsed.error) };
+  const problem = configuredMarketsProblem(parsed.data.config.strategy.markets ?? []);
+  return problem === null ? { ok: true, value: parsed.data } : { ok: false, reason: problem };
+}
+
+/** The Polymarket markets of a single-asset config. Empty for a perp-only key. */
+export function configuredMarkets(doc: ConfigDoc): ThemeMarket[] {
+  return doc.config.strategy.markets ?? [];
 }
 
 export function parseThemeConfig(input: unknown): ParseResult<ThemeConfigDoc> {
   const parsed = ThemeConfigDocSchema.safeParse(input);
   if (!parsed.success) return { ok: false, reason: describe(parsed.error) };
-  const seen = new Set<string>();
-  for (const market of parsed.data.config.strategy.markets) {
-    if (market.tokenIds[0] === market.tokenIds[1]) return { ok: false, reason: `market ${market.conditionId}: the two token ids are the same` };
-    if (seen.has(market.conditionId)) return { ok: false, reason: `market ${market.conditionId} is listed twice` };
-    seen.add(market.conditionId);
-  }
-  return { ok: true, value: parsed.data };
+  const problem = configuredMarketsProblem(parsed.data.config.strategy.markets);
+  return problem === null ? { ok: true, value: parsed.data } : { ok: false, reason: problem };
 }
 
 export function parseTeamConfig(input: unknown): ParseResult<TeamConfigDoc> {
@@ -321,6 +351,14 @@ function targetsIdentityProblem(doc: Pick<ThemeTargetsDoc, "asOf" | "validUntil"
 /** Field checks plus the identity rules every target must satisfy: one entry per market, and the id names the market. */
 export function parseThemeTargets(input: unknown): ParseResult<ThemeTargetsDoc> {
   const parsed = ThemeTargetsSchema.safeParse(input);
+  if (!parsed.success) return { ok: false, reason: describe(parsed.error) };
+  const problem = targetsIdentityProblem(parsed.data);
+  return problem === null ? { ok: true, value: parsed.data } : { ok: false, reason: problem };
+}
+
+/** A single-asset key's markets follow the theme identity rules. Each target is then checked against the settings in asset-markets.ts. */
+export function parseAssetMarketsTargets(input: unknown): ParseResult<AssetMarketsTargetsDoc> {
+  const parsed = AssetMarketsTargetsSchema.safeParse(input);
   if (!parsed.success) return { ok: false, reason: describe(parsed.error) };
   const problem = targetsIdentityProblem(parsed.data);
   return problem === null ? { ok: true, value: parsed.data } : { ok: false, reason: problem };

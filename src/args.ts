@@ -10,8 +10,8 @@ export interface Args {
 
 export class UsageError extends Error {}
 
-const VALUE_FLAGS = new Set(["key", "ceiling", "id", "gateway", "interval", "force-side", "coin", "dex", "region", "size", "lines", "min-usd", "slippage", "max-impact", "to", "set-deposits"]);
-const BOOLEAN_FLAGS = new Set(["dry-run", "once", "force", "yes-place-a-real-order", "help", "version", "yes", "from-tarball", "no-report", "follow", "no-deploy", "execute", "sync"]);
+const VALUE_FLAGS = new Set(["key", "ceiling", "id", "gateway", "interval", "force-side", "coin", "dex", "region", "size", "lines", "min-usd", "slippage", "max-impact", "to", "set-deposits", "venue"]);
+const BOOLEAN_FLAGS = new Set(["dry-run", "once", "force", "yes-place-a-real-order", "help", "version", "yes", "from-tarball", "no-report", "follow", "no-deploy", "execute", "sync", "perp-only"]);
 
 export function parseArgs(argv: string[]): Args {
   const args: Args = { command: "", positionals: [], values: {}, flags: new Set() };

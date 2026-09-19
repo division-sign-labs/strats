@@ -25,6 +25,8 @@ export const sshDir = (): string => join(homeDir(), "ssh");
 export const botFile = (id: string): string => join(botsDir(), `${assertBotId(id)}.json`);
 export const logFile = (id: string): string => join(logsDir(), `${assertBotId(id)}.log`);
 export const runtimeStateFile = (id: string): string => join(stateDir(), `${assertBotId(id)}.json`);
+/** The Polymarket counters of a single-asset bot that also trades markets. Its Hyperliquid counters stay in the file above. */
+export const marketsStateFile = (id: string): string => join(stateDir(), `${assertBotId(id)}.markets.json`);
 /** Every withdrawal and buyback strats buyback has made, one JSON object per line. Only ever appended to. */
 export const payoutsLedgerFile = (id: string): string => join(stateDir(), `${assertBotId(id)}.payouts.jsonl`);
 /** The totals of that record, for the report. Rewritten from the record, and the one payout file a droplet receives. */

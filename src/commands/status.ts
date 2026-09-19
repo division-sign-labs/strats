@@ -4,9 +4,10 @@ import { fetchConfig, fetchTarget } from "../client.js";
 import { describeDecision, px, reconcile, usd } from "../reconcile.js";
 import { sshExec } from "../deploy/ssh.js";
 import { payoutRows, summary } from "../payouts.js";
-import { openSession } from "../session.js";
+import type { ConfigDoc } from "../protocol/index.js";
+import { openSession, type Session } from "../session.js";
 import type { Prompts } from "../setup.js";
-import { isPolymarketBot, pinnedDifferences, type BotState } from "../state.js";
+import { isPolymarketBot, isTwoVenueBot, pinnedDifferences, type BotState } from "../state.js";
 import { Venue, toOrderView } from "../venue.js";
 import { describePublication } from "./config.js";
 import { chainName } from "./init.js";
@@ -45,6 +46,7 @@ export async function status(args: Args, prompts: Prompts): Promise<number> {
   console.log(`Bot "${bot.id}"`);
   row("Wallet", bot.masterAddress);
   row("Trading key", bot.agentAddress ?? "not approved yet (run strats fund)");
+  if (isTwoVenueBot(bot)) row("Polymarket", bot.polymarket ? `deposit wallet ${bot.polymarket.funder}${bot.markets?.fundedAt ? "" : ", not funded yet (run strats fund --venue polymarket)"}` : "not set up yet (run strats init)");
   row("API key", `${bot.keyPrefix}...`);
   row("Ceiling", `${bot.ceilingPct}% of the wallet per position`);
   row("Project page", describePublication(bot));
@@ -54,6 +56,7 @@ export async function status(args: Args, prompts: Prompts): Promise<number> {
     const { strategy, account } = config.value.config;
     row("Config version", `${config.value.version}, updated ${config.value.updatedAt}`);
     row("Asset", strategy.assetKey);
+    if (isTwoVenueBot(bot)) row("Markets", `${strategy.markets?.length ?? 0} on Polymarket`);
     row("Position size", `${account.positionPct}% configured, ${Math.min(account.positionPct, bot.ceilingPct, 50)}% in force`);
   } else {
     row("Config", `not available. ${config.message}`);
@@ -71,6 +74,7 @@ export async function status(args: Args, prompts: Prompts): Promise<number> {
   if (!target.ok) {
     row("Target", `not available. ${target.message}`);
     console.log("The venue is not shown because the target names the coin. The runner holds in this state.");
+    if (isTwoVenueBot(bot)) await showMarkets(session, config.ok ? config.value : undefined);
     return 1;
   }
   const t = target.value.target;
@@ -112,10 +116,22 @@ export async function status(args: Args, prompts: Prompts): Promise<number> {
   } catch (error) {
     row("Profit", `not shown: ${error instanceof Error ? error.message : String(error)}`);
   }
+  if (isTwoVenueBot(bot)) console.log("  The profit split counts the Hyperliquid account. What the Polymarket wallet earns is not split by strats buyback yet.");
   console.log("  Nothing is paid out by itself. strats buyback shows the plan; strats buyback --execute carries it out, from this machine only.");
 
   console.log("Next cycle");
   const decision = reconcile(toReconcileInput({ ok: true, doc: target.value }, snap, Date.now(), config.ok ? config.value.config.account.positionPct : 0, bot.ceilingPct, true, openBlocked(config.ok ? config.value : undefined, config.ok ? "" : config.message, snap)));
   console.log(`  ${describeDecision(decision, t.coin, true)}`);
+  if (isTwoVenueBot(bot)) await showMarkets(session, config.ok ? config.value : undefined);
   return 0;
+}
+
+/** The Polymarket side of a two-venue bot. A failure here never hides the perp's status above. */
+async function showMarkets(session: Session, config: ConfigDoc | undefined): Promise<void> {
+  try {
+    await (await import("./status-theme.js")).statusMarkets(session, config);
+  } catch (error) {
+    console.log("Polymarket");
+    row("Markets", `could not be read. ${error instanceof Error ? error.message : String(error)}`);
+  }
 }

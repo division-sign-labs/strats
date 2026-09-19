@@ -4,15 +4,15 @@
 // the venue could not tell us again after a restart.
 import { UsageError, type Args } from "../args.js";
 import { fetchConfig, fetchTarget } from "../client.js";
-import { runLoop } from "../loop.js";
+import { runLoop, runLoops, type VenueLoop } from "../loop.js";
 import { appendLog } from "../paths.js";
 import type { ConfigDoc, TargetDoc } from "../protocol/index.js";
 import { describeDecision, holdReason, reconcile, type Decision, type ReconcileInput, type Side, type TargetInput } from "../reconcile.js";
-import { Reporter, assetLabel, hyperliquidPositions, publishedWalletAddress, toReportTrade } from "../report.js";
+import { Reporter, assetLabel, hyperliquidPositions, mergeFigures, publishedWalletAddress, toReportTrade, type ReportFigures } from "../report.js";
 import { appendTrade, loadRuntimeState, saveRuntimeState } from "../runtime-state.js";
-import { loadAgentKey, openSession, scrub, sessionSecrets } from "../session.js";
+import { loadAgentKey, openSession, scrub, sessionSecrets, type Session } from "../session.js";
 import type { Prompts } from "../setup.js";
-import { isPolymarketBot, pinnedDifferences } from "../state.js";
+import { isPolymarketBot, isTwoVenueBot, pinnedDifferences } from "../state.js";
 import { Venue, toOrderView, toPositionView, type VenueSnapshot } from "../venue.js";
 
 const CONFIG_REFRESH_MS = 5 * 60_000;
@@ -91,6 +91,48 @@ export async function run(args: Args, prompts: Prompts): Promise<number> {
   const agentPk = dryRun ? undefined : loadAgentKey(session);
   prompts.close();
 
+  const deployed = session.runtime !== undefined;
+  const reporter = new Reporter(session.gateway, "stock-ls", bot.id, report && !dryRun);
+  // The Polymarket side adds its own secrets once its credentials are loaded.
+  const secrets: Array<string | undefined> = [...sessionSecrets(session), agentPk];
+  const emit = (text: string): void => {
+    const line = scrub(`${new Date().toISOString()}  ${dryRun ? "dry run  " : ""}${text}`, secrets);
+    console.log(line);
+    // On a droplet the journal keeps the log.
+    if (!deployed) appendLog(bot.id, line);
+  };
+  const perp = perpLoop(session, { dryRun, forceSide, agentPk, emit, reporter });
+  const markets = isTwoVenueBot(bot) ? await (await import("./run-theme.js")).assetMarketsLoop(session, { dryRun, emit, reporter, secrets }) : undefined;
+
+  if (!once) emit(`Started bot "${bot.id}" for wallet ${bot.masterAddress}${markets ? ` and Polymarket wallet ${bot.polymarket!.funder}` : ""}. ${dryRun ? "Nothing will be signed or sent." : "Orders are live."} Ceiling ${bot.ceilingPct}%.`);
+  const perpOptions = {
+    once, intervalSec, emit, cycle: perp.cycle,
+    stoppedMessage: "Stopped. Positions and their stop and target orders were left as they are on Hyperliquid.",
+    // One report for the whole bot. It follows the perp's cycle, and adds the Polymarket side when there is one.
+    afterCycle: async (line: string): Promise<void> => {
+      const failure = await reporter.maybeSend(Date.now(), scrub(perp.lastAction() || markets?.lastAction() || line, secrets), async () => {
+        const figures = await perp.figures();
+        return markets && figures ? mergeFigures(figures, await markets.figures()) : figures;
+      });
+      if (failure) emit(failure);
+    },
+  };
+  if (!markets) return runLoop(perpOptions);
+  return runLoops([perpOptions, { once, intervalSec, emit, cycle: markets.cycle, stoppedMessage: "Stopped. Positions were left as they are on Polymarket." }]);
+}
+
+export interface PerpLoopOptions {
+  dryRun: boolean;
+  forceSide: ForceSide | undefined;
+  agentPk: string | undefined;
+  emit: (text: string) => void;
+  reporter: Reporter;
+}
+
+/** The Hyperliquid side: one perpetual, managed from the target. */
+export function perpLoop(session: Session, opts: PerpLoopOptions): VenueLoop<ReportFigures> {
+  const { bot } = session;
+  const { dryRun, forceSide, agentPk, emit, reporter } = opts;
   let config: ConfigDoc | undefined;
   let configProblem = "";
   let configAt = 0;
@@ -102,15 +144,6 @@ export async function run(args: Args, prompts: Prompts): Promise<number> {
   let lastSnap: VenueSnapshot | undefined;
   let lastLabel = "";
   let lastAction = "";
-  const deployed = session.runtime !== undefined;
-  const reporter = new Reporter(session.gateway, "stock-ls", bot.id, report && !dryRun);
-
-  const emit = (text: string): void => {
-    const line = scrub(`${new Date().toISOString()}  ${dryRun ? "dry run  " : ""}${text}`, [...sessionSecrets(session), agentPk]);
-    console.log(line);
-    // On a droplet the journal keeps the log.
-    if (!deployed) appendLog(bot.id, line);
-  };
 
   const cycle = async (): Promise<string> => {
     const now = Date.now();
@@ -183,33 +216,27 @@ export async function run(args: Args, prompts: Prompts): Promise<number> {
     return `${tag}${acted}`;
   };
 
-  if (!once) emit(`Started bot "${bot.id}" for wallet ${bot.masterAddress}. ${dryRun ? "Nothing will be signed or sent." : "Orders are live."} Ceiling ${bot.ceilingPct}%.`);
-  return runLoop({
-    once, intervalSec, emit, cycle,
-    stoppedMessage: "Stopped. Positions and their stop and target orders were left as they are on Hyperliquid.",
-    afterCycle: async (line) => {
-      const failure = await reporter.maybeSend(Date.now(), scrub(lastAction || line, [...sessionSecrets(session), agentPk]), async () => {
-        if (!lastVenue || !lastSnap) return null;
-        // A long hold reads nothing from the venue, so take a fresh reading for the totals. It is read-only.
-        lastSnap = await lastVenue.snapshot();
-        const since = Date.parse(bot.createdAt);
-        const deposits = await lastVenue.netDeposits(since);
-        // Without the full deposit history the profit figure would be wrong, so nothing is sent.
-        if (!deposits.complete) return null;
-        // Stops and targets fill while the runner is idle, so the venue's own fill history is the source. The stored figure never decreases.
-        const state = loadRuntimeState(bot.id);
-        const volumeUsd = Math.max(state.volumeUsd, await lastVenue.volumeSince(since).catch(() => 0));
-        if (volumeUsd !== state.volumeUsd) saveRuntimeState(bot.id, { ...loadRuntimeState(bot.id), volumeUsd });
-        return {
-          venue: "hyperliquid", equityUsd: lastSnap.equityUsd, netDepositsUsd: deposits.amountUsd, volumeUsd, openPositions: lastSnap.position ? 1 : 0,
-          positions: hyperliquidPositions(lastSnap.position, lastSnap.market.quote.mid, lastLabel),
-          trades: loadRuntimeState(bot.id).trades,
-          walletAddress: publishedWalletAddress(bot),
-        };
-      });
-      if (failure) emit(failure);
-    },
-  });
+  const figures = async (): Promise<ReportFigures | null> => {
+    if (!lastVenue || !lastSnap) return null;
+    // A long hold reads nothing from the venue, so take a fresh reading for the totals. It is read-only.
+    lastSnap = await lastVenue.snapshot();
+    const since = Date.parse(bot.createdAt);
+    const deposits = await lastVenue.netDeposits(since);
+    // Without the full deposit history the profit figure would be wrong, so nothing is sent.
+    if (!deposits.complete) return null;
+    // Stops and targets fill while the runner is idle, so the venue's own fill history is the source. The stored figure never decreases.
+    const state = loadRuntimeState(bot.id);
+    const volumeUsd = Math.max(state.volumeUsd, await lastVenue.volumeSince(since).catch(() => 0));
+    if (volumeUsd !== state.volumeUsd) saveRuntimeState(bot.id, { ...loadRuntimeState(bot.id), volumeUsd });
+    return {
+      venue: "hyperliquid", equityUsd: lastSnap.equityUsd, netDepositsUsd: deposits.amountUsd, volumeUsd, openPositions: lastSnap.position ? 1 : 0,
+      positions: hyperliquidPositions(lastSnap.position, lastSnap.market.quote.mid, lastLabel),
+      trades: loadRuntimeState(bot.id).trades,
+      walletAddress: publishedWalletAddress(bot),
+    };
+  };
+
+  return { cycle, figures, lastAction: () => lastAction };
 }
 
 /** Venue fields for a cycle that holds before reading the venue. reconcile returns hold before it looks at them. */

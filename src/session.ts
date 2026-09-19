@@ -9,9 +9,13 @@ import { normalizeGatewayUrl, type GatewayOptions } from "./client.js";
 import { ensureHome } from "./paths.js";
 import { RUNTIME_CREDS_ENV, decodeRuntimeCreds, type PolymarketCreds, type RuntimeCredsDoc } from "./runtime-creds.js";
 import { checkPassphrase, openKeystore, readPassphrase, readSecret, type Prompts } from "./setup.js";
-import { API_KEY_ROLE, loadBot, resolveBotId, type BotState } from "./state.js";
+import { API_KEY_ROLE, isTwoVenueBot, loadBot, resolveBotId, type BotState } from "./state.js";
 
 export const POLYMARKET_L2_ROLE = "polymarket-l2";
+/** A two-venue bot's Polymarket signer. It is a key of its own, so deploying the bot never sends the Hyperliquid master key anywhere. */
+export const POLYMARKET_SIGNER_ROLE = "polymarket-signer";
+/** The keystore entry that signs this bot's Polymarket orders. */
+export const polymarketSignerRole = (bot: Pick<BotState, "strategyId" | "markets">): string => (isTwoVenueBot(bot) ? POLYMARKET_SIGNER_ROLE : KeyRoles.master);
 
 export interface Session {
   bot: BotState;
@@ -76,7 +80,7 @@ export function loadPolymarketCreds(session: Session): PolymarketCreds {
     if (!session.runtime.polymarket) throw new Error("The runtime credentials carry no Polymarket account. Run strats deploy again.");
     return session.runtime.polymarket;
   }
-  const signerPk = readSecret(session.keystore!, bot.id, KeyRoles.master, session.passphrase!);
+  const signerPk = readSecret(session.keystore!, bot.id, polymarketSignerRole(bot), session.passphrase!);
   const l2Raw = readSecret(session.keystore!, bot.id, POLYMARKET_L2_ROLE, session.passphrase!);
   if (!signerPk || !l2Raw) throw new Error("The keystore has no Polymarket credentials. Run: strats init --force");
   if (addressFromPk(signerPk).toLowerCase() !== bot.polymarket.signerAddress.toLowerCase()) {

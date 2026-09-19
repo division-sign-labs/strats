@@ -8,26 +8,31 @@ const HELP = `strats: run a TokenStrats strategy from your own wallet.
 
 Quotient decides what to hold and serves it as targets. This program holds the
 keys, sizes the positions, and places the orders: one Hyperliquid perp for a
-single-asset strategy, Polymarket markets for a theme strategy, and a team's
-games on Polymarket for a team strategy. Non-custodial: Quotient never holds a
+single-asset strategy, plus the asset's Polymarket markets when the settings list
+any; Polymarket markets for a theme strategy; and a team's games on Polymarket
+for a team strategy. One key is one bot. Non-custodial: Quotient never holds a
 key and nothing it receives feeds a decision.
 
 Usage
-  strats init --key qsk_... [--ceiling N] [--id name] [--gateway url] [--no-deploy] [--region blr1] [-y] [--force]
+  strats init --key qsk_... [--ceiling N] [--id name] [--gateway url] [--no-deploy] [--perp-only] [--region blr1] [-y] [--force]
       The whole install. Read the settings, create the wallet and keystore, pin the payout settings,
       show the address to fund and wait for the deposit, then deploy the runner to a droplet (blr1, Bangalore).
       A theme or team key also sets up the Polymarket account. Asks once whether to publish the wallet address; the default is no.
+      A single-asset key with Polymarket markets is still one bot: init sets up Hyperliquid and the Polymarket account, funds the
+      perp, then funds Polymarket. That last step can be skipped, at its question or with --perp-only, to start with the perp only.
       Stop at any point with Ctrl-C and run strats init again: it continues where it stopped and keeps the wallet.
       --no-deploy stops after funding; strats run then runs the bot on this machine. -y accepts the deploy question.
       --region, --size and --from-tarball apply to the deploy step, as in strats deploy.
       --force reads the settings again and replaces them; the wallet is kept.
       The key can also come from STRATS_API_KEY or a prompt, which keeps it out of shell history.
-  strats fund [--id name] [--dex name]
+  strats fund [--id name] [--dex name] [--venue hyperliquid|polymarket]
       The funding step of init, on its own, and the way to add funds later.
       Single asset: deposit USDC from Arbitrum into Hyperliquid and approve a trading key.
       Theme and team: show the deposit address, wait for the credit, verify the trading approvals.
+      Single asset with markets: --venue polymarket funds the Polymarket side; without it the perp is funded.
   strats run [--id name] [--dry-run] [--once] [--interval 30] [--no-report] [--force-side long|short|flat]
       The loop. One line per cycle. --dry-run sends nothing. --no-report sends no report to Quotient.
+      Single asset with markets: the perp loop and the markets loop run side by side, and neither waits for or stops the other.
       --force-side trades a made-up target for testing (single asset only); without --dry-run it also needs --yes-place-a-real-order.
       Refuses to start while the bot is deployed, unless --force.
   strats deploy [--id name] [--region blr1] [--size s-1vcpu-1gb] [--from-tarball] [--dry-run] [-y]
@@ -42,8 +47,8 @@ Usage
       Stop the runner and delete the droplet and its firewall. Positions are not touched.
   strats status [--id name]
       Wallet, equity, positions, the current targets, settings, and the deployed runner's last lines.
-  strats close [--id name] [--coin COIN]
-      Close what the bot holds, after a y/N confirm.
+  strats close [--id name] [--coin COIN] [--venue polymarket]
+      Close what the bot holds, after a y/N confirm. Single asset with markets: the perp, or with --venue polymarket the markets.
   strats buyback [--id name] [--execute] [--min-usd 25] [--slippage 1] [--max-impact 3] [--dex name]
       Split the bot's profit as pinned on this machine, withdraw the buyback share to the bot's own wallet, and swap it
       for your token through LI.FI. Without --execute it is a dry run: it reads everything, fetches a live quote, prints

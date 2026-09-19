@@ -112,7 +112,9 @@ export function checkPassphrase(keystore: Keystore, botId: string, passphrase: s
 }
 
 /** The SetupContext handed to the adapter's funding flow. Secrets go to and from the encrypted keystore only. */
-export function makeSetupContext(botId: string, keystore: Keystore, passphrase: string, prompts: Prompts, opts: { skipDepositWait?: boolean } = {}): SetupContext {
+export function makeSetupContext(botId: string, keystore: Keystore, passphrase: string, prompts: Prompts, opts: { skipDepositWait?: boolean; masterRole?: string } = {}): SetupContext {
+  // The Polymarket flow signs with the entry it calls "master". A two-venue bot hands it a key of its own instead of the Hyperliquid master key.
+  const roleOf = (role: string): string => (role === "master" && opts.masterRole ? opts.masterRole : role);
   return {
     // The funds are already there, so the flow goes straight to its checks instead of waiting for another deposit.
     ...(opts.skipDepositWait ? { pollSkippable: async () => null } : {}),
@@ -138,8 +140,8 @@ export function makeSetupContext(botId: string, keystore: Keystore, passphrase: 
         await new Promise((resolve) => setTimeout(resolve, interval));
       }
     },
-    getSecret: async (role) => readSecret(keystore, botId, role, passphrase),
+    getSecret: async (role) => readSecret(keystore, botId, roleOf(role), passphrase),
     // putEntry is synchronous and fsyncs before it returns, so the agent key is durable before the venue approval.
-    putSecret: async (role, value, meta = {}) => keystore.putEntry(botId, role, value, passphrase, meta),
+    putSecret: async (role, value, meta = {}) => keystore.putEntry(botId, roleOf(role), value, passphrase, meta),
   };
 }

@@ -2,8 +2,8 @@
 // up is the display-only report. Never throws: every failure comes back as a
 // typed result so the run loop can hold instead of crashing.
 import {
-  STRATEGY_ID, TEAM_STRATEGY_ID, encodeReport, THEME_STRATEGY_ID, parseConfig, parseTarget, parseTeamConfig, parseTeamTargets, parseThemeConfig, parseThemeTargets,
-  type AnyConfigDoc, type ConfigDoc, type ParseResult, type Report, type StrategyId, type TargetDoc, type TeamConfigDoc, type TeamTargetsDoc, type ThemeConfigDoc, type ThemeTargetsDoc,
+  STRATEGY_ID, TEAM_STRATEGY_ID, encodeReport, THEME_STRATEGY_ID, parseAssetMarketsTargets, parseConfig, parseTarget, parseTeamConfig, parseTeamTargets, parseThemeConfig, parseThemeTargets,
+  type AnyConfigDoc, type AssetMarketsTargetsDoc, type ConfigDoc, type ParseResult, type Report, type StrategyId, type TargetDoc, type TeamConfigDoc, type TeamTargetsDoc, type ThemeConfigDoc, type ThemeTargetsDoc,
 } from "./protocol/index.js";
 
 export const DEFAULT_GATEWAY_URL = "https://quotient-api-gateway.onrender.com";
@@ -93,6 +93,11 @@ export function fetchConfig(opts: GatewayOptions): Promise<FetchResult<ConfigDoc
 
 export function fetchTarget(opts: GatewayOptions): Promise<FetchResult<TargetDoc>> {
   return getJson(opts, `/api/v1/strategies/${STRATEGY_ID}/target`, parseTarget);
+}
+
+/** The targets for a single-asset key's Polymarket markets. The perp's target is fetchTarget, as before. */
+export function fetchAssetMarketsTargets(opts: GatewayOptions): Promise<FetchResult<AssetMarketsTargetsDoc>> {
+  return getJson(opts, `/api/v1/strategies/${STRATEGY_ID}/targets`, parseAssetMarketsTargets);
 }
 
 export function fetchThemeConfig(opts: GatewayOptions): Promise<FetchResult<ThemeConfigDoc>> {

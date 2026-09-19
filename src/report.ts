@@ -181,6 +181,25 @@ export interface ReportFigures {
   walletAddress?: string | undefined;
 }
 
+/**
+ * One report for a single-asset bot that also trades markets. The totals are the sum of both venues, and the positions
+ * and trades of both are listed; each position names its own venue. The report's venue and wallet stay the perp's.
+ * Without the Polymarket reading the total would show a smaller wallet than the bot has, so nothing is sent.
+ */
+export function mergeFigures(perp: ReportFigures, markets: ReportFigures | null): ReportFigures | null {
+  if (!markets) return null;
+  return {
+    venue: perp.venue,
+    equityUsd: perp.equityUsd + markets.equityUsd,
+    netDepositsUsd: perp.netDepositsUsd + markets.netDepositsUsd,
+    volumeUsd: perp.volumeUsd + markets.volumeUsd,
+    openPositions: perp.openPositions + markets.openPositions,
+    positions: [...(perp.positions ?? []), ...(markets.positions ?? [])],
+    trades: [...(perp.trades ?? []), ...(markets.trades ?? [])].sort((a, b) => Date.parse(b.at) - Date.parse(a.at)),
+    walletAddress: perp.walletAddress,
+  };
+}
+
 export function buildReport(figures: ReportFigures, lastAction: string, now: number): Report {
   return {
     v: 1,

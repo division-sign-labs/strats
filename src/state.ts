@@ -34,8 +34,16 @@ export const BotStateSchema = z.object({
   keyPrefix: z.string().max(12),
   masterAddress: address,
   agentAddress: address.optional(),
-  /** Theme and team bots: the Polymarket account. masterAddress is its signer; funder is the deposit wallet that holds the funds. */
+  /**
+   * The Polymarket account. funder is the deposit wallet that holds the funds. A theme or team bot signs with masterAddress.
+   * A single-asset bot that also trades markets signs with a key of its own, so its Hyperliquid master key never leaves this machine.
+   */
   polymarket: z.object({ signerAddress: address, funder: address, signatureType: z.number().int() }).optional(),
+  /**
+   * Present only on a single-asset bot whose settings list Polymarket markets: one key, one bot, two venues.
+   * It records the Polymarket funding step, which may be skipped to start with the perp only. Bots created before 0.5.0 have no field.
+   */
+  markets: z.object({ fundedAt: z.string().optional(), skippedAt: z.string().optional() }).optional(),
   deployment: DeploymentSchema.optional(),
   /** When strats fund last finished. Bots funded before 0.3.0 have no field. */
   fundedAt: z.string().optional(),
@@ -57,6 +65,12 @@ export type Pinned = BotState["pinned"];
 
 /** Theme and team bots trade on Polymarket from a deposit wallet; a single-asset bot trades on Hyperliquid. */
 export const isPolymarketBot = (bot: Pick<BotState, "strategyId">): boolean => bot.strategyId !== "stock-ls";
+
+/** A single-asset bot that also trades its asset's Polymarket markets: the perp on Hyperliquid and the markets on Polymarket, under one key. */
+export const isTwoVenueBot = (bot: Pick<BotState, "strategyId" | "markets">): boolean => bot.strategyId === "stock-ls" && bot.markets !== undefined;
+
+/** A two-venue bot keeps its Polymarket counters in a file of their own, because both loops run in one process. */
+export const marketsStateScope = (bot: Pick<BotState, "strategyId" | "markets">): "markets" | undefined => (isTwoVenueBot(bot) ? "markets" : undefined);
 
 export function botExists(id: string): boolean {
   return existsSync(botFile(id));

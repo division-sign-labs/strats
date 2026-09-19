@@ -13,6 +13,23 @@ export interface LoopOptions {
   stoppedMessage: string;
 }
 
+/** One venue's side of a bot: its cycle, the figures it can report, and the last thing it did. */
+export interface VenueLoop<F> {
+  cycle: () => Promise<string>;
+  /** Null when the numbers are not trustworthy right now. */
+  figures: () => Promise<F | null>;
+  lastAction: () => string;
+}
+
+/**
+ * Several loops in one process, each with its own cycle, wait and backoff, so an error or a HOLD in one never delays another.
+ * Ctrl-C or SIGTERM stops them all. The exit code is the worst of theirs.
+ */
+export async function runLoops(loops: LoopOptions[]): Promise<number> {
+  const codes = await Promise.all(loops.map((loop) => runLoop(loop)));
+  return Math.max(0, ...codes);
+}
+
 export async function runLoop(opts: LoopOptions): Promise<number> {
   let stopping = false;
   let wake: (() => void) | undefined;

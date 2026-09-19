@@ -1,10 +1,12 @@
-// A theme bot and a team bot run the same Polymarket loop. What differs is where
-// the settings and the targets come from, and which markets the bot may trade:
-// a theme bot trades the markets its creator chose, a team bot trades its
-// team's games after the local check in team-markets.ts.
-import { fetchTeamConfig, fetchTeamTargets, fetchThemeConfig, fetchThemeTargets, type FetchResult, type GatewayOptions } from "./client.js";
-import type { TeamConfigDoc, TeamTargetsDoc, ThemeConfigDoc, ThemeMarket, ThemeTargetsDoc } from "./protocol/index.js";
-import type { BotState } from "./state.js";
+// Every Polymarket bot runs the same loop. What differs is where the settings
+// and the targets come from, and which markets the bot may trade: a theme bot
+// trades the markets its creator chose, a team bot trades its team's games after
+// the local check in team-markets.ts, and a single-asset bot trades its asset's
+// markets after the local check in asset-markets.ts.
+import { assetMarketsForCycle } from "./asset-markets.js";
+import { fetchAssetMarketsTargets, fetchConfig, fetchTeamConfig, fetchTeamTargets, fetchThemeConfig, fetchThemeTargets, type FetchResult, type GatewayOptions } from "./client.js";
+import type { AssetMarketsTargetsDoc, ConfigDoc, TeamConfigDoc, TeamTargetsDoc, ThemeConfigDoc, ThemeMarket, ThemeTargetsDoc } from "./protocol/index.js";
+import { isTwoVenueBot, type BotState } from "./state.js";
 import { teamMarketsForCycle, themeView } from "./team-markets.js";
 
 export interface CycleMarkets {
@@ -18,10 +20,13 @@ export interface CycleMarkets {
   quoteTokenIds: string[];
 }
 
-export interface PolymarketSource<C extends ThemeConfigDoc | TeamConfigDoc = ThemeConfigDoc | TeamConfigDoc, T extends ThemeTargetsDoc | TeamTargetsDoc = ThemeTargetsDoc | TeamTargetsDoc> {
-  strategyId: "theme" | "team";
+export type PolymarketConfigDoc = ThemeConfigDoc | TeamConfigDoc | ConfigDoc;
+export type PolymarketTargetsDoc = ThemeTargetsDoc | TeamTargetsDoc | AssetMarketsTargetsDoc;
+
+export interface PolymarketSource<C extends PolymarketConfigDoc = PolymarketConfigDoc, T extends PolymarketTargetsDoc = PolymarketTargetsDoc> {
+  strategyId: "theme" | "team" | "stock-ls";
   /** The log prefix. */
-  label: "theme" | "team";
+  label: "theme" | "team" | "markets";
   fetchConfig(gateway: GatewayOptions): Promise<FetchResult<C>>;
   fetchTargets(gateway: GatewayOptions): Promise<FetchResult<T>>;
   /** Without settings there is nothing to check a market against, so the list is empty and nothing is traded. */
@@ -51,8 +56,21 @@ export const TEAM_SOURCE: PolymarketSource<TeamConfigDoc, TeamTargetsDoc> = {
   }),
 };
 
-export function sourceFor(bot: Pick<BotState, "strategyId">): PolymarketSource {
+/** The Polymarket side of a single-asset bot. The settings are the same document the perp reads. */
+export const ASSET_SOURCE: PolymarketSource<ConfigDoc, AssetMarketsTargetsDoc> = {
+  strategyId: "stock-ls",
+  label: "markets",
+  fetchConfig,
+  fetchTargets: fetchAssetMarketsTargets,
+  marketsFor: (config, targets) => ({
+    ...assetMarketsForCycle(targets, config?.config.strategy ?? {}),
+    quoteTokenIds: [...targets.targets.map((t) => t.tokenId), ...targets.closed.map((c) => c.tokenId)],
+  }),
+};
+
+export function sourceFor(bot: Pick<BotState, "strategyId" | "markets">): PolymarketSource {
   if (bot.strategyId === "team") return TEAM_SOURCE as PolymarketSource;
   if (bot.strategyId === "theme") return THEME_SOURCE as PolymarketSource;
+  if (isTwoVenueBot(bot)) return ASSET_SOURCE as PolymarketSource;
   throw new Error("This bot does not trade on Polymarket.");
 }

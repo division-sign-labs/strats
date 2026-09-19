@@ -4,7 +4,7 @@
 // a theme bot enters each market once. A missing or damaged file is treated as empty.
 import { existsSync, readFileSync } from "node:fs";
 import { z } from "zod";
-import { runtimeStateFile, writePrivateFile } from "./paths.js";
+import { marketsStateFile, runtimeStateFile, writePrivateFile } from "./paths.js";
 import { REPORT_MAX_TRADES, ReportTradeSchema, type ReportTrade } from "./protocol/index.js";
 
 const RuntimeStateSchema = z.object({
@@ -38,9 +38,13 @@ export function appendTrade(trades: readonly ReportTrade[], trade: ReportTrade):
 
 export const emptyRuntimeState = (): RuntimeState => RuntimeStateSchema.parse({ v: 1 });
 
-export function loadRuntimeState(id: string): RuntimeState {
+/** "markets" names the Polymarket counters of a two-venue bot. Every other bot has one file. */
+export type StateScope = "markets" | undefined;
+const fileOf = (id: string, scope: StateScope): string => (scope === "markets" ? marketsStateFile(id) : runtimeStateFile(id));
+
+export function loadRuntimeState(id: string, scope?: StateScope): RuntimeState {
   try {
-    const path = runtimeStateFile(id);
+    const path = fileOf(id, scope);
     if (!existsSync(path)) return emptyRuntimeState();
     const parsed = RuntimeStateSchema.safeParse(JSON.parse(readFileSync(path, "utf8")));
     return parsed.success ? parsed.data : emptyRuntimeState();
@@ -50,9 +54,9 @@ export function loadRuntimeState(id: string): RuntimeState {
 }
 
 /** A failed write never stops the loop. */
-export function saveRuntimeState(id: string, state: RuntimeState): void {
+export function saveRuntimeState(id: string, state: RuntimeState, scope?: StateScope): void {
   try {
-    writePrivateFile(runtimeStateFile(id), `${JSON.stringify(RuntimeStateSchema.parse({ ...state, trades: state.trades.slice(0, REPORT_MAX_TRADES) }), null, 2)}\n`);
+    writePrivateFile(fileOf(id, scope), `${JSON.stringify(RuntimeStateSchema.parse({ ...state, trades: state.trades.slice(0, REPORT_MAX_TRADES) }), null, 2)}\n`);
   } catch {
     // Counters only; the next cycle tries again.
   }

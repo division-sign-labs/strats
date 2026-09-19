@@ -3,7 +3,7 @@
 // reads it from STRATS_RUNTIME_CREDS when present. It never contains the
 // keystore, the passphrase, or a Hyperliquid master key.
 import { z } from "zod";
-import { BotStateSchema, isPolymarketBot, type BotState } from "./state.js";
+import { BotStateSchema, isPolymarketBot, isTwoVenueBot, type BotState } from "./state.js";
 
 export const RUNTIME_CREDS_ENV = "STRATS_RUNTIME_CREDS";
 
@@ -48,13 +48,14 @@ export function buildRuntimeCreds(input: RuntimeCredsInput): RuntimeCredsDoc {
   if (isPolymarketBot(input.bot) ? !input.polymarket : !input.hyperliquid) {
     throw new Error("The trading credentials for this bot's venue are missing. Run strats fund first.");
   }
+  // A two-venue bot carries both arms. Its Polymarket arm is optional here: without it the droplet runs the perp only.
+  const polymarket = isPolymarketBot(input.bot) || isTwoVenueBot(input.bot) ? input.polymarket : undefined;
   return RuntimeCredsSchema.parse({
     apiKey: input.apiKey,
     gatewayUrl: input.gatewayUrl,
     botState,
-    ...(isPolymarketBot(input.bot)
-      ? { polymarket: input.polymarket }
-      : { hyperliquid: { agentPk: input.hyperliquid!.agentPk, masterAddress: input.hyperliquid!.masterAddress } }),
+    ...(isPolymarketBot(input.bot) ? {} : { hyperliquid: { agentPk: input.hyperliquid!.agentPk, masterAddress: input.hyperliquid!.masterAddress } }),
+    ...(polymarket ? { polymarket } : {}),
   });
 }
 

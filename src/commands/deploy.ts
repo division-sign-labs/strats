@@ -21,10 +21,10 @@ import { pushPayoutSummary } from "../payouts.js";
 import { RUNTIME_CREDS_ENV, buildRuntimeCreds, encodeRuntimeCreds } from "../runtime-creds.js";
 import { loadAgentKey, loadPolymarketCreds, openSession, requireKeystore, runtimeCredsPresent, type KeystoreSession } from "../session.js";
 import type { Prompts } from "../setup.js";
-import { isPolymarketBot, loadBot, resolveBotId, saveBot, type BotState } from "../state.js";
+import { isPolymarketBot, isTwoVenueBot, loadBot, resolveBotId, saveBot, type BotState } from "../state.js";
 import { packageRoot, packageVersion } from "../version.js";
 
-/** Polymarket refuses orders from the United States, so a theme or team bot is never placed there. */
+/** Polymarket refuses orders from the United States, so a bot that trades there is never placed there. */
 export const US_REGION_SLUGS = ["nyc1", "nyc2", "nyc3", "sfo1", "sfo2", "sfo3", "atl1"];
 
 /** Plain names for the regions people pick. Any other slug is shown as it is. */
@@ -67,6 +67,13 @@ export function monthlyCost(size: string): string {
 /** What the droplet receives, in plain words. Shown before anything is created. */
 export function disclosure(bot: BotState): string[] {
   const common = ["the API key", `this bot's settings file, which holds addresses, percentages and your choice about publishing the wallet (${bot.publishWallet === true ? "published" : "not published"}), and nothing secret`];
+  if (isTwoVenueBot(bot)) {
+    return [
+      `Sent to the droplet over ssh: ${common.join("; ")}; the Hyperliquid trading key, which can place orders and cannot withdraw; the Polymarket signer key and its API credentials.`,
+      "The droplet holds the Polymarket signer key. Polymarket signs every order with it, so there is no trading-only key to send instead. Whoever controls the droplet controls the funds in this Polymarket wallet. Keep only what the bot needs in it.",
+      "The Hyperliquid wallet's master key, the keystore file and its passphrase stay on this machine.",
+    ];
+  }
   if (isPolymarketBot(bot)) {
     return [
       `Sent to the droplet over ssh: ${common.join("; ")}; the Polymarket wallet key and its API credentials.`,
@@ -81,7 +88,8 @@ export function disclosure(bot: BotState): string[] {
 }
 
 function readiness(bot: BotState): string | null {
-  if (isPolymarketBot(bot)) return bot.polymarket ? null : "This bot has no Polymarket account yet. Run: strats init";
+  if ((isPolymarketBot(bot) || isTwoVenueBot(bot)) && !bot.polymarket) return "This bot has no Polymarket account yet. Run: strats init";
+  if (isPolymarketBot(bot)) return null;
   return bot.agentAddress ? null : "This bot has no approved trading key yet. Run: strats fund";
 }
 
@@ -131,7 +139,7 @@ function writeRemote(target: Target, path: string, content: string, mode: string
 }
 
 function printPlan(bot: BotState, region: string, size: string, version: string, source: string): void {
-  console.log(`Deploy bot "${bot.id}" (${STRATEGY_DESCRIPTIONS[bot.strategyId]})`);
+  console.log(`Deploy bot "${bot.id}" (${isTwoVenueBot(bot) ? "single asset, on Hyperliquid and Polymarket" : STRATEGY_DESCRIPTIONS[bot.strategyId]})`);
   console.log(`  Droplet          ${dropletName(bot.id)}, ${DROPLET_IMAGE}`);
   console.log(`  Region           ${regionLabel(region)}`);
   console.log(`  Size             ${size}, ${monthlyCost(size)}`);
@@ -155,7 +163,7 @@ export async function deployBot(args: Args, prompts: Prompts, open?: KeystoreSes
   if (!/^[a-z0-9-]{2,40}$/.test(region) || !/^[a-z0-9-]{2,60}$/.test(size)) throw new Error("--region and --size take DigitalOcean slugs such as blr1 and s-1vcpu-1gb.");
   const bot = open?.bot ?? loadBot(resolveBotId(args.values.id));
   const version = packageVersion();
-  if (isPolymarketBot(bot) && US_REGION_SLUGS.includes(region)) {
+  if ((isPolymarketBot(bot) || isTwoVenueBot(bot)) && US_REGION_SLUGS.includes(region)) {
     throw new Error(`Polymarket refuses orders from the United States, and ${region} is a US region. Choose another, for example --region ${DEFAULT_REGION}.`);
   }
 
@@ -203,9 +211,8 @@ export async function deployBot(args: Args, prompts: Prompts, open?: KeystoreSes
     apiKey: session.gateway.apiKey,
     gatewayUrl: session.gateway.gatewayUrl,
     bot,
-    ...(isPolymarketBot(bot)
-      ? { polymarket: loadPolymarketCreds(session) }
-      : { hyperliquid: { agentPk: loadAgentKey(session), masterAddress: bot.masterAddress } }),
+    ...(isPolymarketBot(bot) ? {} : { hyperliquid: { agentPk: loadAgentKey(session), masterAddress: bot.masterAddress } }),
+    ...(isPolymarketBot(bot) || isTwoVenueBot(bot) ? { polymarket: loadPolymarketCreds(session) } : {}),
   }));
 
   const { publicKey } = ensureKeypair();

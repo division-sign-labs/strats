@@ -6,7 +6,7 @@ There are three strategies. The API key you copy from TokenStrats belongs to one
 
 | Strategy | Venue | What it holds |
 |---|---|---|
-| Single asset (`stock-ls`) | Hyperliquid | One perpetual, long or short, with a stop and a target resting on the venue |
+| Single asset (`stock-ls`) | Hyperliquid, and Polymarket when the settings list markets | One perpetual, long or short, with a stop and a target resting on the venue. With markets: also shares in the asset's Polymarket markets. See "Single asset with markets" |
 | Your own theme (`theme`) | Polymarket | Shares in the markets you chose for your theme, each bought once and sold at a take-profit price or when the market closes |
 | Back a team (`team`) | Polymarket | One side of your team's next game, bought once before the game starts and held to the final whistle. See "Back a team" |
 
@@ -21,8 +21,8 @@ npx @quotient-forecasting/strats init --key qsk_...
 It works the same way for every strategy, and goes through these steps in order:
 
 1. **Settings.** Reads the settings you saved on TokenStrats and shows them. Asks for your local ceiling, whether to publish the wallet address (the default is no), and a keystore passphrase.
-2. **Wallet.** Creates the wallet on this machine and encrypts its keys. For a theme or team key it also creates the Polymarket account the wallet trades from, which costs nothing.
-3. **Funding.** Shows the address and what to send, waits for the deposit, and moves it into the venue. You are asked before each transfer.
+2. **Wallet.** Creates the wallet on this machine and encrypts its keys. For a theme or team key, or a single-asset key with markets, it also creates the Polymarket account, which costs nothing.
+3. **Funding.** Shows the address and what to send, waits for the deposit, and moves it into the venue. You are asked before each transfer. A single-asset key with markets funds the perp first and Polymarket second, and the second can be skipped.
 4. **Deploy.** Puts the runner on a DigitalOcean droplet in your own account, in region `blr1` (Bangalore). It shows the plan, the monthly cost and exactly what will be sent to the droplet, and asks before creating anything.
 5. **Watching it.** Prints how to follow the bot: `strats status`, `strats logs`, and the public project page at https://tokenstrats.xyz/projects.
 
@@ -125,6 +125,8 @@ A deployed runner keeps the choice it was deployed with until you run `strats de
 
 A single-asset bot's keystore holds three entries: the master key (owns the funds, used only by `fund` and `buyback --execute`), the trading key (an approved Hyperliquid agent that can trade but cannot withdraw, used by `run` and `close`), and the API key.
 
+A single-asset bot with markets adds two: a Polymarket signer key of its own and the Polymarket API credentials. The signer is a separate key, so the Hyperliquid master key still never leaves this machine.
+
 A theme or team bot's keystore holds the wallet key, the Polymarket API credentials, and the API key. Polymarket has no trading-only key: its SDK signs every order with the wallet's own key, and that key controls the deposit wallet that holds the funds. `run`, `status` and `close` therefore load it. Keep only what the bot needs in that wallet.
 
 The bot file next to the keystore holds only addresses and settings.
@@ -208,6 +210,7 @@ One value, `STRATS_RUNTIME_CREDS`, in that 0600 file. It holds:
 - the API key and the gateway URL;
 - the bot file: addresses, your ceiling, the pinned payout settings, and your choice about publishing the wallet address, none of it secret;
 - for a single-asset bot, the Hyperliquid trading key and the wallet's public address. The trading key can place orders and cannot withdraw;
+- for a single-asset bot with markets, both: the Hyperliquid trading key, and the Polymarket signer key with its API credentials. The droplet holds the Polymarket signer key, so whoever controls the droplet controls the funds in the Polymarket wallet. It never holds the Hyperliquid master key;
 - for a theme or team bot, the Polymarket wallet key, the deposit wallet's address and the Polymarket API credentials. There is no trading-only key on Polymarket, so whoever controls the droplet controls the funds in that wallet. `deploy` says so before it asks.
 
 After a buyback the droplet also receives `state/<id>.payouts.json`: the dollars bought back and the date and amount of each withdrawal, so its report shows the right totals. It holds no secret and gives the droplet nothing to act on.
@@ -252,6 +255,20 @@ The theme targets name the markets to hold (`targets`) and the configured market
 
 Before every buy the runner asks Polymarket for the wallet's balance of that exact token and does not buy if it holds any. A market is entered once: the runner records the target's id and never buys it again, even after a take-profit sale. If an order's result is unknown (a timeout after sending), it is not resent and that market is left alone for 15 minutes. A redemption is submitted once per market and never retried. At most three markets are entered per cycle. Sells are sized to what the wallet actually holds, so they can only reduce a position.
 
+## Single asset with markets
+
+A single-asset key whose settings list Polymarket markets is one strategy, one key and one bot on two venues: the perp on Hyperliquid and the asset's markets on Polymarket. A key with no markets behaves exactly as before.
+
+**init** runs once. It creates the Hyperliquid wallet as always, a separate Polymarket signer key, and the Polymarket account. Funding has two steps, each continued on its own by running `strats init` again: USDC on Arbitrum for the perp, then the Polymarket deposit address for the markets. The second step can be skipped, at its question or with `--perp-only`; the bot then trades the perp only until you run `strats fund --venue polymarket`, and `strats deploy` after it if the bot is deployed.
+
+**run** runs two loops in one process: the perp loop, unchanged, and the markets loop, which is the theme loop reading `GET /api/v1/strategies/stock-ls/targets`. Each has its own wait and backoff, so an error or a HOLD in one never delays or stops the other. If the Polymarket side cannot start, one line says so and the perp runs alone.
+
+The server names an outcome only when Q has forecast the market, the outcome's price is at least 0.70, and Q's probability is at least 5 points above it; the limit is Q less 5 points, at most 0.97, and shares are held to resolution. The runner checks each target again against the settings before it trades: the market is one you chose, the outcome is one your direction allows (long: the outcome good for a long; short: the other; both: either), Q's forecast is present, the limit is between 0.70 and 0.97, and Q is at least 5 points above it. A target that fails is refused in the log, and its market is still managed so a holding can be sold or redeemed.
+
+**The report** is one per cycle, with venue `hyperliquid`. Equity, deposits, volume and open positions are the sum of both venues, and positions and trades from both are listed; each position names its venue. If the Polymarket wallet cannot be read, no report is sent rather than one that shows a smaller wallet. The Polymarket counters are kept in `state/<id>.markets.json`.
+
+**status** shows both venues. **close** closes the perp; `strats close --venue polymarket` sells the positions in the chosen markets. **buyback** splits the Hyperliquid account's profit only; what the Polymarket wallet earns is not split yet.
+
 ## Position size, the local ceiling, and pinned payout settings
 
 Position size is a share of wallet equity at 1x isolated leverage:
@@ -276,6 +293,7 @@ The Hyperliquid adapter this program uses only opens positions when the account 
 - Buybacks by themselves. Nothing is paid out until you run `strats buyback --execute` on your own machine and answer y.
 - Other withdrawals. The kept share of the profit, and your deposits, stay on the venue until you withdraw them with the wallet key using other tooling.
 - Single asset: more than one position. One asset, one position, no pyramiding.
+- Single asset with markets: a buyback from the Polymarket wallet. `strats buyback` splits the Hyperliquid account's profit only. Its markets have no stops, like a theme's.
 - Theme: stops. A theme position is sold at its take-profit price or when its market closes, and otherwise held to resolution. It can go to zero.
 - Theme: adding to a position, or entering the same market a second time.
 - Team: selling before the game ends. See "Back a team".

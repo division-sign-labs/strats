@@ -1,12 +1,12 @@
-// strats status for a theme or team bot. Read-only: the venue it builds refuses every order.
-import { sourceFor } from "../polymarket-source.js";
-import { TEAM_BET_MODES } from "../protocol/index.js";
+// strats status for a theme or team bot, and for the Polymarket side of a single-asset bot. Read-only: the venue it builds refuses every order.
+import { ASSET_SOURCE, sourceFor } from "../polymarket-source.js";
+import { TEAM_BET_MODES, type ConfigDoc } from "../protocol/index.js";
 import { usd } from "../reconcile.js";
 import { describeThemeDecision, reconcileTheme, themeEffectivePct } from "../reconcile-theme.js";
 import { depositsLessWithdrawals, payoutRows, summary } from "../payouts.js";
 import { loadRuntimeState } from "../runtime-state.js";
 import { loadPolymarketCreds, type Session } from "../session.js";
-import { pinnedDifferences } from "../state.js";
+import { marketsStateScope, pinnedDifferences } from "../state.js";
 import { gameCounts } from "../team-markets.js";
 import { PolymarketVenue } from "../venue-polymarket.js";
 import { describePublication } from "./config.js";
@@ -38,7 +38,7 @@ export async function statusTheme(session: Session): Promise<number> {
       row("Bet", bet?.label ?? strategy.mode);
       if (bet?.usesMargin) row("Lead needed", `${strategy.marginPts} point${strategy.marginPts === 1 ? "" : "s"}`);
       row("Pay at most", `${strategy.maxPriceCents}¢`);
-    } else {
+    } else if (config.value.config.strategyId === "theme") {
       const { strategy } = config.value.config;
       row("Thesis", strategy.thesis);
       row("Markets", `${strategy.markets.length} configured`);
@@ -121,4 +121,52 @@ export async function statusTheme(session: Session): Promise<number> {
   });
   console.log(`  ${describeThemeDecision(decision, true)}`);
   return 0;
+}
+
+/** The Polymarket side of a single-asset bot that also trades markets: the targets, the wallet, and what the next cycle would do. */
+export async function statusMarkets(session: Session, config: ConfigDoc | undefined): Promise<void> {
+  const { bot } = session;
+  const targets = await ASSET_SOURCE.fetchTargets(session.gateway);
+  const now = Date.now();
+
+  console.log("Market targets");
+  const allowed = targets.ok ? ASSET_SOURCE.marketsFor(config, targets.value) : undefined;
+  if (targets.ok && allowed) {
+    row("Mode", targets.value.mode);
+    row("Fresh", now <= Date.parse(targets.value.validUntil) ? `yes, valid until ${targets.value.validUntil}` : `no, expired at ${targets.value.validUntil}`);
+    row("To hold", `${allowed.doc.targets.length} market${allowed.doc.targets.length === 1 ? "" : "s"}`);
+    for (const t of allowed.doc.targets.slice(0, 40)) console.log(`    ${t.outcome} at up to ${t.maxPrice}${t.q !== null ? `, Q ${t.q}` : ""}: ${t.question}`);
+    row("Closed", `${targets.value.closed.length} market${targets.value.closed.length === 1 ? "" : "s"}`);
+    for (const note of allowed.refused) row("Refused", note);
+  } else if (!targets.ok) {
+    row("Targets", `not available. ${targets.message} The markets hold in this state. The perp is not affected.`);
+  }
+
+  console.log("Polymarket");
+  if (!bot.polymarket) {
+    row("Account", "not set up yet. Run: strats init");
+    return;
+  }
+  const markets = allowed?.markets ?? config?.config.strategy.markets ?? [];
+  const venue = new PolymarketVenue(bot.polymarket, loadPolymarketCreds(session), { readOnly: true });
+  const snap = await venue.snapshot(markets, allowed?.quoteTokenIds ?? []);
+  row("Equity", `${usd(snap.equityUsd)}: ${usd(snap.collateralUsd)} free, ${usd(snap.exposureUsd)} in positions`);
+  const configured = new Set(markets.flatMap((m) => m.tokenIds));
+  for (const h of snap.holdings) {
+    const question = markets.find((m) => m.tokenIds.includes(h.tokenId))?.question ?? h.label ?? h.tokenId.slice(0, 12);
+    row(configured.has(h.tokenId) ? "Position" : "Other position", `${h.size} shares worth ${usd(h.valueUsd)}${h.redeemable ? ", redeemable" : ""}: ${question}${configured.has(h.tokenId) ? "" : " (not managed by this bot)"}`);
+  }
+  if (snap.holdings.length === 0) row("Positions", "none");
+
+  console.log("Next cycle, markets");
+  const state = loadRuntimeState(bot.id, marketsStateScope(bot));
+  const decision = reconcileTheme({
+    targets: allowed ? { ok: true, doc: allowed.doc } : { ok: false, reason: targets.ok ? "" : targets.message },
+    now: Date.now(), markets, holdings: snap.holdings, quotes: snap.quotes,
+    collateralUsd: snap.collateralUsd, equityUsd: snap.equityUsd, exposureUsd: snap.exposureUsd,
+    positionPct: config?.config.account.positionPct ?? 0, ceilingPct: bot.ceilingPct,
+    blockedTargetIds: Object.keys(state.entered), redeemedConditionIds: Object.keys(state.redeemed), pendingTokenIds: snap.pendingTokenIds,
+    ...(config ? {} : { openBlockedReason: "The settings could not be loaded. Not opening." }),
+  });
+  console.log(`  ${describeThemeDecision(decision, true)}`);
 }

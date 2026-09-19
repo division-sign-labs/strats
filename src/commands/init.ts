@@ -10,12 +10,12 @@ import { UsageError, type Args } from "../args.js";
 import { DEFAULT_GATEWAY_URL, discoverConfig, fetchConfigFor, normalizeGatewayUrl } from "../client.js";
 import { STAGE_NAMES, nextInitStage, type InitStage } from "../install.js";
 import { DEFAULT_BOT_ID, assertBotId, ensureHome, keysDir } from "../paths.js";
-import { TEAM_BET_MODES, type AnyConfigDoc } from "../protocol/index.js";
+import { TEAM_BET_MODES, configuredMarkets, type AnyConfigDoc } from "../protocol/index.js";
 import { VENUE_MIN_NOTIONAL_USD, effectivePct } from "../reconcile.js";
 import { THEME_DEFAULT_MIN_SHARES } from "../reconcile-theme.js";
-import { POLYMARKET_L2_ROLE, openSession, requireKeystore, type KeystoreSession } from "../session.js";
+import { POLYMARKET_L2_ROLE, POLYMARKET_SIGNER_ROLE, openSession, polymarketSignerRole, requireKeystore, type KeystoreSession } from "../session.js";
 import { checkPassphrase, makeSetupContext, openKeystore, readPassphrase, type Prompts } from "../setup.js";
-import { API_KEY_ROLE, MAX_POSITION_PCT, botExists, isPolymarketBot, loadBot, saveBot, type BotState } from "../state.js";
+import { API_KEY_ROLE, MAX_POSITION_PCT, botExists, isPolymarketBot, isTwoVenueBot, loadBot, saveBot, type BotState } from "../state.js";
 import { buildAdapter } from "../venue.js";
 import { buildPolymarketAdapter } from "../venue-polymarket.js";
 import { PROJECTS_URL, deployBot, watchLines } from "./deploy.js";
@@ -43,9 +43,11 @@ function describeStrategy(config: AnyConfigDoc["config"]): string[] {
       `  Markets          ${config.strategy.markets.length} chosen on TokenStrats`,
     ];
   }
+  const markets = config.strategy.markets?.length ?? 0;
   return [
-    "  Strategy         Single asset, on Hyperliquid",
+    `  Strategy         Single asset, on Hyperliquid${markets > 0 ? " and Polymarket" : ""}`,
     `  Asset            ${config.strategy.assetKey}`,
+    ...(markets > 0 ? [`  Markets          ${markets} on Polymarket, chosen on TokenStrats`] : []),
   ];
 }
 
@@ -124,6 +126,16 @@ async function setup(args: Args, prompts: Prompts, id: string, gatewayUrl: strin
   if (previous && previous.strategyId !== strategyId) {
     throw new Error(`Bot "${id}" was set up for the other strategy and its wallet may hold funds there. Create a separate bot for this key with --id.`);
   }
+  // A single asset with Polymarket markets is still one bot. Its Polymarket orders are signed by a key of their own,
+  // so the droplet, which must hold that key, never holds the key that owns the Hyperliquid funds.
+  const tradesMarkets = config.value.strategyId === "stock-ls" && configuredMarkets(config.value).length > 0;
+  const markets = tradesMarkets ? previous?.markets ?? {} : previous?.markets;
+  let polymarketSigner = keystore.entryMeta(id, POLYMARKET_SIGNER_ROLE)?.address;
+  if (markets && !polymarketSigner) {
+    const signer = generateEoa();
+    keystore.putEntry(id, POLYMARKET_SIGNER_ROLE, signer.privateKey, passphrase, { address: signer.address, runtimeEligible: true });
+    polymarketSigner = signer.address;
+  }
   const bot: BotState = {
     v: 1,
     id,
@@ -133,6 +145,7 @@ async function setup(args: Args, prompts: Prompts, id: string, gatewayUrl: strin
     masterAddress,
     ...(keptWallet && agentAddress ? { agentAddress } : {}),
     ...(previous?.polymarket ? { polymarket: previous.polymarket } : {}),
+    ...(markets ? { markets } : {}),
     ...(previous?.deployment ? { deployment: previous.deployment } : {}),
     ...(previous?.fundedAt ? { fundedAt: previous.fundedAt } : {}),
     publishWallet,
@@ -146,6 +159,7 @@ async function setup(args: Args, prompts: Prompts, id: string, gatewayUrl: strin
 
   console.log(keptWallet ? "Kept the existing wallet." : "Wallet created.");
   console.log(isPolymarketBot(bot) ? `  Signing address  ${masterAddress} (signs orders; do not send funds here)` : `  Address          ${masterAddress}`);
+  if (isTwoVenueBot(bot)) console.log(`  Polymarket key   ${polymarketSigner} (signs Polymarket orders; do not send funds here)`);
   console.log(`  Keystore         ${keysDir()} (encrypted)`);
   console.log(`  Ceiling          ${ceilingPct}% of the wallet per position`);
   console.log(`  Project page     ${publishWallet ? "shows the wallet address, as you chose" : "does not show the wallet address"}. To change it: strats config publish-wallet on|off`);
@@ -154,11 +168,11 @@ async function setup(args: Args, prompts: Prompts, id: string, gatewayUrl: strin
   return { bot, keystore, passphrase, gateway: { gatewayUrl, apiKey } };
 }
 
-/** Theme and team bots: a deposit wallet owned by the bot's key, API credentials, and the trading approvals. It costs nothing. */
+/** Bots that trade on Polymarket: a deposit wallet owned by the bot's key, API credentials, and the trading approvals. It costs nothing. */
 async function setupPolymarketAccount(session: KeystoreSession, prompts: Prompts): Promise<number> {
   const { bot, keystore, passphrase } = session;
-  console.log("Setting up the Polymarket account. This creates a deposit wallet owned by the key above and approves trading. It costs nothing.");
-  const base = makeSetupContext(bot.id, keystore, passphrase, prompts);
+  console.log(`Setting up the Polymarket account. This creates a deposit wallet owned by the ${isTwoVenueBot(bot) ? "Polymarket key" : "key"} above and approves trading. It costs nothing.`);
+  const base = makeSetupContext(bot.id, keystore, passphrase, prompts, { masterRole: polymarketSignerRole(bot) });
   try {
     const acct = await buildPolymarketAdapter().setup({ ...base, select: async (question, choices) => (question === "Polymarket account" ? "create" : (await prompts.ask(`${question} (${choices.map((c) => c.value).join("/")})`)).trim()) });
     if (acct.venue !== "polymarket") throw new Error("the adapter returned a different venue");
@@ -172,11 +186,13 @@ async function setupPolymarketAccount(session: KeystoreSession, prompts: Prompts
   }
 }
 
-/** Where to send the money and how much the bot needs. `positionPct` is null when the settings could not be read just now. */
-async function printFundingInstructions(bot: BotState, positionPct: number | null): Promise<void> {
+/**
+ * Where to send the money and how much the bot needs. `positionPct` is null when the settings could not be read just now.
+ * A two-venue bot is shown both venues at its first funding step, and Polymarket alone when only that step is left.
+ */
+async function printFundingInstructions(bot: BotState, positionPct: number | null, only?: "polymarket"): Promise<void> {
   const pct = positionPct === null ? null : effectivePct(positionPct, bot.ceilingPct);
-  console.log("Fund the wallet");
-  if (isPolymarketBot(bot)) {
+  const polymarket = async (): Promise<void> => {
     console.log(`  Polymarket deposit wallet  ${bot.polymarket!.funder}`);
     try {
       const instructions = await buildPolymarketAdapter().fundingInstructions({ venue: "polymarket", ...bot.polymarket! });
@@ -186,21 +202,42 @@ async function printFundingInstructions(bot: BotState, positionPct: number | nul
     }
     console.log(`  The smallest order Polymarket accepts is ${THEME_DEFAULT_MIN_SHARES} shares.${pct === null ? "" : ` At ${pct}% per position the wallet needs at least $${Math.ceil((THEME_DEFAULT_MIN_SHARES * 100) / pct)} to trade.`}`);
     console.log("  Polymarket refuses orders from the United States. The deploy step places the runner in a region where it can trade.");
-  } else {
+  };
+  const hyperliquid = async (): Promise<void> => {
     const funding = (await buildAdapter("").fundingInstructions({ venue: "hyperliquid", masterAddress: bot.masterAddress })).addresses[0];
     console.log(`  Send USDC on Arbitrum to ${bot.masterAddress}.`);
     console.log(`  Hyperliquid's minimum deposit is ${funding?.minimum ?? 5} USDC. A smaller deposit is lost.`);
     console.log(`  The smallest order Hyperliquid accepts is $${VENUE_MIN_NOTIONAL_USD}.${pct === null ? "" : ` At ${pct}% per position the wallet needs at least $${Math.ceil((VENUE_MIN_NOTIONAL_USD * 100) / pct)} to trade.`} Deposit somewhat more to leave room for rounding and fees.`);
     console.log("  The wallet also needs a little ETH on Arbitrum to pay for the deposit transaction.");
+  };
+  console.log("Fund the wallet");
+  if (!isTwoVenueBot(bot)) {
+    await (isPolymarketBot(bot) ? polymarket() : hyperliquid());
+  } else {
+    if (only !== "polymarket") {
+      console.log("  Hyperliquid, for the perp. This step comes first.");
+      await hyperliquid();
+    }
+    if (bot.polymarket) {
+      console.log(`  Polymarket, for the markets.${only === "polymarket" ? "" : " This step comes second, and it can be skipped to start with the perp only."}`);
+      await polymarket();
+    }
   }
   console.log("");
+}
+
+/** The Polymarket funding step of a two-venue bot is optional: --perp-only skips it, and at a terminal the creator is asked. */
+async function skipsPolymarketFunding(args: Args, prompts: Prompts): Promise<boolean> {
+  if (args.flags.has("perp-only")) return true;
+  if (!prompts.interactive) return false;
+  return !(await prompts.confirm("Fund Polymarket now? Without it the bot trades the perp only.", true));
 }
 
 function sayLocalRun(bot: BotState): void {
   console.log("To run it on this machine");
   console.log("  strats run --dry-run --once    shows what it would do and sends nothing");
   console.log("  strats run                     the loop; it trades for as long as it stays open");
-  if (isPolymarketBot(bot)) console.log("  Polymarket refuses orders from the United States. From there, use strats deploy.");
+  if (isPolymarketBot(bot) || isTwoVenueBot(bot)) console.log("  Polymarket refuses orders from the United States. From there, use strats deploy.");
   console.log("To put it on a droplet later: strats deploy");
   console.log(`The public project page: ${PROJECTS_URL}`);
 }
@@ -262,15 +299,23 @@ export async function init(args: Args, prompts: Prompts): Promise<number> {
     if (stage === "account") {
       const code = await setupPolymarketAccount(session, prompts);
       if (code !== 0) return code;
-    } else if (stage === "fund") {
+    } else if (stage === "fund" || stage === "fund-markets") {
       if (positionPct === null) {
         const config = await fetchConfigFor(session.bot.strategyId, session.gateway);
         if (config.ok) positionPct = config.value.config.account.positionPct;
       }
-      await printFundingInstructions(session.bot, positionPct);
+      const polymarketStep = stage === "fund-markets";
+      if (polymarketStep && (await skipsPolymarketFunding(args, prompts))) {
+        session.bot = { ...session.bot, markets: { ...session.bot.markets, skippedAt: new Date().toISOString() } };
+        saveBot(session.bot);
+        console.log("Polymarket is not funded, so the bot trades the perp only. To fund it later: strats fund --venue polymarket");
+        console.log("");
+        continue;
+      }
+      await printFundingInstructions(session.bot, positionPct, polymarketStep ? "polymarket" : undefined);
       let code = 1;
       try {
-        code = await fundSession(session, stepArgs, prompts, { chained: true });
+        code = await fundSession(session, stepArgs, prompts, { chained: true, ...(polymarketStep ? { venue: "polymarket" as const } : {}) });
       } catch (error) {
         console.log(`Funding did not finish: ${error instanceof Error ? error.message : String(error)}`);
       }
