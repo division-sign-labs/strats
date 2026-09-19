@@ -155,6 +155,12 @@ export class Venue {
     return { amountUsd: result.flows.reduce((sum, flow) => sum + flow.amount, 0), complete: result.complete };
   }
 
+  /** Cumulative notional of this wallet's fills since `sinceTs`, all coins on this dex. */
+  async volumeSince(sinceTs: number): Promise<number> {
+    const fills = await this.adapter.fills(this.acct, sinceTs);
+    return fills.reduce((sum, fill) => sum + fill.size * fill.price, 0);
+  }
+
   /**
    * Reference sequence: isolated 1x leverage, IOC entry under a deterministic
    * client id, wait until the position is visible, then a stop sized to the

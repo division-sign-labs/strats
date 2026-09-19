@@ -54,7 +54,7 @@ describe("bot file", () => {
   });
 
   const bot: BotState = {
-    v: 1, id: "alpha", gatewayUrl: "https://quotient-api-gateway.onrender.com", keyPrefix: "qsk_639e3797",
+    v: 1, id: "alpha", strategyId: "stock-ls", gatewayUrl: "https://quotient-api-gateway.onrender.com", keyPrefix: "qsk_639e3797",
     masterAddress: "0x1234567890abcdef1234567890abcdef12345678", ceilingPct: 5, pinned, createdAt: "2026-09-18T00:00:00.000Z",
   };
 
@@ -69,7 +69,7 @@ describe("bot file", () => {
     assert.equal(statSync(botFile("alpha")).mode & 0o777, 0o600);
     assert.deepEqual(loadBot("alpha"), bot);
     const raw = readFileSync(botFile("alpha"), "utf8");
-    assert.deepEqual(Object.keys(JSON.parse(raw)).sort(), ["ceilingPct", "createdAt", "gatewayUrl", "id", "keyPrefix", "masterAddress", "pinned", "v"]);
+    assert.deepEqual(Object.keys(JSON.parse(raw)).sort(), ["ceilingPct", "createdAt", "gatewayUrl", "id", "keyPrefix", "masterAddress", "pinned", "strategyId", "v"]);
   });
 
   it("refuses a key prefix longer than 12 characters", () => {

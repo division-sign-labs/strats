@@ -3,14 +3,56 @@
 // is signed on this machine by the cassie-core funding flow.
 import type { Args } from "../args.js";
 import { fetchTarget } from "../client.js";
-import { openSession } from "../session.js";
+import { loadRuntimeState, saveRuntimeState } from "../runtime-state.js";
+import type { PolymarketCreds } from "../runtime-creds.js";
+import { loadPolymarketCreds, openSession, requireKeystore, type KeystoreSession } from "../session.js";
 import { makeSetupContext, type Prompts } from "../setup.js";
 import { saveBot } from "../state.js";
 import { buildAdapter } from "../venue.js";
+import { buildPolymarketAdapter } from "../venue-polymarket.js";
+
+/** Theme bots: show the deposit address, wait for the credit, and verify the trading approvals. */
+async function fundPolymarket(session: KeystoreSession, prompts: Prompts): Promise<number> {
+  const { bot } = session;
+  if (!bot.polymarket) {
+    console.log("This bot has no Polymarket account yet. Run: strats init --force");
+    return 1;
+  }
+  console.log("What this does");
+  console.log("  1. Shows the address to send USDC to. Polymarket's bridge credits it to the deposit wallet as pUSD.");
+  console.log(`  2. Waits for the credit to arrive in the deposit wallet ${bot.polymarket.funder}.`);
+  console.log("  3. Checks that the trading approvals are in place, and sets any that are missing. This costs nothing.");
+  console.log("");
+  let creds: PolymarketCreds | undefined;
+  try {
+    creds = loadPolymarketCreds(session);
+  } catch {
+    // The funding flow derives the API credentials itself when the keystore has none yet.
+  }
+  const adapter = buildPolymarketAdapter(creds);
+  const acct = { venue: "polymarket" as const, ...bot.polymarket };
+  const read = async (): Promise<number | undefined> => (await adapter.balances(acct).catch(() => []))[0]?.total;
+  const before = creds ? await read() : undefined;
+  await adapter.runFundingFlow(makeSetupContext(bot.id, session.keystore, session.passphrase, prompts), acct);
+  const after = await read();
+  if (after !== undefined) {
+    // Profit is measured against what was deposited. Polymarket has no deposit history to read, so it is recorded here.
+    const state = loadRuntimeState(bot.id);
+    const arrived = before !== undefined ? Math.max(0, after - before) : 0;
+    if (state.netDepositsUsd === undefined) saveRuntimeState(bot.id, { ...state, netDepositsUsd: after });
+    else if (arrived > 0.01) saveRuntimeState(bot.id, { ...state, netDepositsUsd: state.netDepositsUsd + arrived });
+    console.log(`Deposit wallet balance: ${after.toFixed(2)} pUSD.`);
+  }
+  console.log("");
+  console.log("Next: strats run --dry-run --once   (shows what it would do, sends nothing)");
+  console.log("Then: strats deploy   (or strats run, from a location where Polymarket accepts orders)");
+  return 0;
+}
 
 export async function fund(args: Args, prompts: Prompts): Promise<number> {
-  const session = await openSession(args, prompts);
+  const session = requireKeystore(await openSession(args, prompts), "fund");
   const { bot } = session;
+  if (bot.strategyId === "theme") return fundPolymarket(session, prompts);
 
   // The asset decides the venue account: main-dex coins trade from the main account, HIP-3 coins from their own dex.
   let dex = args.values.dex === "main" ? "" : args.values.dex;

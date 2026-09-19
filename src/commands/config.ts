@@ -1,7 +1,7 @@
 // strats config [show|accept]: compare the server's settings with the pinned payout settings, and re-pin on request.
 import { UsageError, type Args } from "../args.js";
-import { fetchConfig } from "../client.js";
-import { openSession } from "../session.js";
+import { fetchConfig, fetchThemeConfig } from "../client.js";
+import { openSession, requireKeystore } from "../session.js";
 import type { Prompts } from "../setup.js";
 import { pinnedDifferences, saveBot } from "../state.js";
 import { chainName, describeConfig } from "./init.js";
@@ -10,9 +10,9 @@ export async function config(args: Args, prompts: Prompts): Promise<number> {
   const action = args.positionals[0] ?? "show";
   if (action !== "show" && action !== "accept") throw new UsageError("Use: strats config show, or strats config accept.");
 
-  const session = await openSession(args, prompts);
+  const session = requireKeystore(await openSession(args, prompts), "config");
   const { bot } = session;
-  const fetched = await fetchConfig(session.gateway);
+  const fetched = bot.strategyId === "theme" ? await fetchThemeConfig(session.gateway) : await fetchConfig(session.gateway);
   if (!fetched.ok) {
     console.log(`Could not read the settings. ${fetched.message}`);
     return 1;

@@ -20,8 +20,11 @@ export function homeDir(): string {
 export const keysDir = (): string => join(homeDir(), "keys");
 export const botsDir = (): string => join(homeDir(), "bots");
 export const logsDir = (): string => join(homeDir(), "logs");
+export const stateDir = (): string => join(homeDir(), "state");
+export const sshDir = (): string => join(homeDir(), "ssh");
 export const botFile = (id: string): string => join(botsDir(), `${assertBotId(id)}.json`);
 export const logFile = (id: string): string => join(logsDir(), `${assertBotId(id)}.log`);
+export const runtimeStateFile = (id: string): string => join(stateDir(), `${assertBotId(id)}.json`);
 
 /** mkdir honors the umask and ignores existing directories, so set the mode explicitly. */
 export function ensurePrivateDir(dir: string): void {

@@ -2,19 +2,41 @@
 import type { Args } from "../args.js";
 import { fetchConfig, fetchTarget } from "../client.js";
 import { describeDecision, px, reconcile, usd } from "../reconcile.js";
+import { sshExec } from "../deploy/ssh.js";
 import { openSession } from "../session.js";
 import type { Prompts } from "../setup.js";
-import { pinnedDifferences } from "../state.js";
+import { pinnedDifferences, type BotState } from "../state.js";
 import { Venue, toOrderView } from "../venue.js";
 import { chainName } from "./init.js";
 import { openBlocked, toReconcileInput } from "./run.js";
 
-const row = (label: string, value: string): void => console.log(`  ${label.padEnd(16)} ${value}`);
+export const row = (label: string, value: string): void => console.log(`  ${label.padEnd(16)} ${value}`);
+
+/** The deployed runner's own last lines, read over ssh. A failure here never hides the rest of the status. */
+export function showDeployment(bot: BotState): void {
+  console.log("Deployed runner");
+  if (!bot.deployment) {
+    row("Droplet", "none. This bot runs only where you run it. strats deploy puts it on a droplet.");
+    return;
+  }
+  const d = bot.deployment;
+  row("Droplet", `${d.host} (${d.region}, ${d.size}), runner ${d.version}, deployed ${d.deployedAt}`);
+  const unit = `strats@${bot.id}`;
+  const result = sshExec({ host: d.host, user: "root" }, `systemctl is-active ${unit}; journalctl -u ${unit} -n 20 --no-pager -o cat`, undefined, { timeoutMs: 30_000 });
+  const lines = result.stdout.trimEnd().split("\n");
+  if (!result.stdout.trim()) {
+    row("Service", `could not be read over ssh. ${(result.stderr || "").trim().slice(0, 200)}`);
+    return;
+  }
+  row("Service", lines[0] ?? "unknown");
+  for (const line of lines.slice(1)) console.log(`    ${line}`);
+}
 
 export async function status(args: Args, prompts: Prompts): Promise<number> {
   const session = await openSession(args, prompts);
   prompts.close();
   const { bot } = session;
+  if (bot.strategyId === "theme") return (await import("./status-theme.js")).statusTheme(session);
   const [config, target] = await Promise.all([fetchConfig(session.gateway), fetchTarget(session.gateway)]);
   const now = Date.now();
 
@@ -39,6 +61,8 @@ export async function status(args: Args, prompts: Prompts): Promise<number> {
     const differences = pinnedDifferences(bot.pinned, config.value.config.account);
     if (differences.length > 0) row("Server differs", `${differences.join("; ")}. The pinned values stay in force until: strats config accept`);
   }
+
+  showDeployment(bot);
 
   console.log("Target");
   if (!target.ok) {

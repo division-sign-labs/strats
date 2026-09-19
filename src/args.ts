@@ -10,8 +10,8 @@ export interface Args {
 
 export class UsageError extends Error {}
 
-const VALUE_FLAGS = new Set(["key", "ceiling", "id", "gateway", "interval", "force-side", "coin", "dex"]);
-const BOOLEAN_FLAGS = new Set(["dry-run", "once", "force", "yes-place-a-real-order", "help", "version"]);
+const VALUE_FLAGS = new Set(["key", "ceiling", "id", "gateway", "interval", "force-side", "coin", "dex", "region", "size", "lines"]);
+const BOOLEAN_FLAGS = new Set(["dry-run", "once", "force", "yes-place-a-real-order", "help", "version", "yes", "from-tarball", "no-report", "follow"]);
 
 export function parseArgs(argv: string[]): Args {
   const args: Args = { command: "", positionals: [], values: {}, flags: new Set() };
@@ -19,6 +19,10 @@ export function parseArgs(argv: string[]): Args {
     const token = argv[i]!;
     if (token === "-h") {
       args.flags.add("help");
+    } else if (token === "-y") {
+      args.flags.add("yes");
+    } else if (token === "-f") {
+      args.flags.add("follow");
     } else if (token.startsWith("--")) {
       const [name = "", inline] = token.slice(2).split(/=(.*)/s, 2);
       if (BOOLEAN_FLAGS.has(name)) {

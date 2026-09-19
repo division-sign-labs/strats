@@ -11,14 +11,30 @@ export const MAX_POSITION_PCT = 50;
 
 const address = z.string().regex(/^0x[0-9a-fA-F]{40}$/);
 
+/** Where the bot runs unattended. Addresses and ids only. */
+export const DeploymentSchema = z.object({
+  dropletId: z.number().int().positive(),
+  host: z.string().min(1),
+  region: z.string().min(1),
+  size: z.string().min(1),
+  version: z.string().min(1),
+  deployedAt: z.string(),
+});
+export type Deployment = z.infer<typeof DeploymentSchema>;
+
 export const BotStateSchema = z.object({
   v: z.literal(1),
   id: z.string(),
+  /** Bots created before 0.2.0 have no field and are single-asset bots. */
+  strategyId: z.enum(["stock-ls", "theme"]).default("stock-ls"),
   gatewayUrl: z.string().min(1),
   /** First 12 characters of the API key, for recognition only. */
   keyPrefix: z.string().max(12),
   masterAddress: address,
   agentAddress: address.optional(),
+  /** Theme bots: the Polymarket account. masterAddress is its signer; funder is the deposit wallet that holds the funds. */
+  polymarket: z.object({ signerAddress: address, funder: address, signatureType: z.number().int() }).optional(),
+  deployment: DeploymentSchema.optional(),
   ceilingPct: z.number().positive().max(MAX_POSITION_PCT),
   pinned: z.object({ token: TokenSchema, split: SplitSchema }),
   createdAt: z.string(),
