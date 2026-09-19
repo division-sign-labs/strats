@@ -1,0 +1,92 @@
+// strats status: everything worth knowing, read fresh from the gateway and the venue. Read-only.
+import type { Args } from "../args.js";
+import { fetchConfig, fetchTarget } from "../client.js";
+import { describeDecision, px, reconcile, usd } from "../reconcile.js";
+import { openSession } from "../session.js";
+import type { Prompts } from "../setup.js";
+import { pinnedDifferences } from "../state.js";
+import { Venue, toOrderView } from "../venue.js";
+import { chainName } from "./init.js";
+import { openBlocked, toReconcileInput } from "./run.js";
+
+const row = (label: string, value: string): void => console.log(`  ${label.padEnd(16)} ${value}`);
+
+export async function status(args: Args, prompts: Prompts): Promise<number> {
+  const session = await openSession(args, prompts);
+  prompts.close();
+  const { bot } = session;
+  const [config, target] = await Promise.all([fetchConfig(session.gateway), fetchTarget(session.gateway)]);
+  const now = Date.now();
+
+  console.log(`Bot "${bot.id}"`);
+  row("Wallet", bot.masterAddress);
+  row("Trading key", bot.agentAddress ?? "not approved yet (run strats fund)");
+  row("API key", `${bot.keyPrefix}...`);
+  row("Ceiling", `${bot.ceilingPct}% of the wallet per position`);
+
+  console.log("Settings");
+  if (config.ok) {
+    const { strategy, account } = config.value.config;
+    row("Config version", `${config.value.version}, updated ${config.value.updatedAt}`);
+    row("Asset", strategy.assetKey);
+    row("Position size", `${account.positionPct}% configured, ${Math.min(account.positionPct, bot.ceilingPct, 50)}% in force`);
+  } else {
+    row("Config", `not available. ${config.message}`);
+  }
+  row("Pinned token", `${bot.pinned.token.address} on ${chainName(bot.pinned.token.chainId)}`);
+  row("Pinned split", `${bot.pinned.split.buybackPct}% buys the token, ${bot.pinned.split.keepPct}% is kept`);
+  if (config.ok) {
+    const differences = pinnedDifferences(bot.pinned, config.value.config.account);
+    if (differences.length > 0) row("Server differs", `${differences.join("; ")}. The pinned values stay in force until: strats config accept`);
+  }
+
+  console.log("Target");
+  if (!target.ok) {
+    row("Target", `not available. ${target.message}`);
+    console.log("The venue is not shown because the target names the coin. The runner holds in this state.");
+    return 1;
+  }
+  const t = target.value.target;
+  row("Coin", `${t.coin} on ${t.dex ? `the "${t.dex}" dex` : "the main dex"}`);
+  row("Side", t.side === "flat" ? `flat (${t.flatReason})` : `${t.side}, entry limit ${px(t.entryLimit ?? 0)}, target ${px(t.targetPx ?? 0)}, stop ${px(t.stopPx ?? 0)}`);
+  if (t.side !== "flat") row("Signal", `${t.signalId ?? "no id"}, revision ${t.revision ?? "none"}, expires ${t.expiresAt ?? "never"}`);
+  row("Mode", target.value.mode);
+  row("Reason", t.reason);
+  row("Fresh", now <= Date.parse(target.value.validUntil) ? `yes, valid until ${target.value.validUntil}` : `no, expired at ${target.value.validUntil}`);
+
+  console.log("Hyperliquid");
+  const venue = new Venue({ coin: t.coin, dex: t.dex, masterAddress: bot.masterAddress, ...(bot.agentAddress ? { agentAddress: bot.agentAddress } : {}) });
+  const snap = await venue.snapshot();
+  row("Account mode", snap.standardMode ? "Standard" : `"${snap.accountMode}" (positions can only be opened in Standard mode)`);
+  row("Equity", `${usd(snap.equityUsd)}, ${usd(snap.availableUsd)} free`);
+  if (t.dex && snap.fundingBalanceUsd > 0) row("Not yet moved", `${usd(snap.fundingBalanceUsd)} in the main account (run strats fund)`);
+  row("Price", `${px(snap.market.quote.mid)} (bid ${px(snap.market.quote.bid)}, ask ${px(snap.market.quote.ask)})`);
+  const p = snap.position;
+  row("Position", p ? `${p.side.toLowerCase()} ${p.size} ${t.coin} from ${px(p.avgPrice)}, unrealized ${usd(p.unrealizedPnl ?? 0)}, ${p.marginMode ?? "unknown"} margin at ${p.leverage ?? "?"}x` : "none");
+  const exits = snap.orders.map(toOrderView).filter((o) => o.reduceOnly);
+  const stop = exits.find((o) => o.isTrigger && o.triggerKind === "sl");
+  const limit = exits.find((o) => !o.isTrigger);
+  row("Stop order", stop ? `${px(stop.triggerPx ?? 0)} for ${stop.remainingSize} (order ${stop.id})` : "none");
+  row("Target order", limit ? `${px(limit.price)} for ${limit.remainingSize} (order ${limit.id})` : "none");
+  for (const other of snap.otherPositions) row("Other position", `${other.side.toLowerCase()} ${other.size} ${other.marketRef} (not managed by this bot)`);
+
+  console.log("Profit split");
+  try {
+    const deposits = await venue.netDeposits(Date.parse(bot.createdAt));
+    if (deposits.complete) {
+      const profit = Math.max(0, snap.equityUsd - deposits.amountUsd);
+      row("Profit", `${usd(profit)} (equity ${usd(snap.equityUsd)} less net deposits ${usd(deposits.amountUsd)}, open positions included)`);
+      row("Would pay", `${usd((profit * bot.pinned.split.buybackPct) / 100)} to buy the token, ${usd((profit * bot.pinned.split.keepPct) / 100)} kept`);
+    } else {
+      row("Profit", "not shown: the deposit history could not be read in full");
+    }
+  } catch (error) {
+    row("Profit", `not shown: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  console.log("  The buyback is not implemented in v1. Nothing is paid out and no funds leave the wallet.");
+
+  console.log("Next cycle");
+  const decision = reconcile(toReconcileInput({ ok: true, doc: target.value }, snap, Date.now(), config.ok ? config.value.config.account.positionPct : 0, bot.ceilingPct, true, openBlocked(config.ok ? config.value : undefined, config.ok ? "" : config.message, snap)));
+  console.log(`  ${describeDecision(decision, t.coin, true)}`);
+  return 0;
+}
