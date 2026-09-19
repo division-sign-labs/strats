@@ -3,9 +3,10 @@ import type { Args } from "../args.js";
 import { fetchConfig, fetchTarget } from "../client.js";
 import { describeDecision, px, reconcile, usd } from "../reconcile.js";
 import { sshExec } from "../deploy/ssh.js";
+import { payoutRows, summary } from "../payouts.js";
 import { openSession } from "../session.js";
 import type { Prompts } from "../setup.js";
-import { pinnedDifferences, type BotState } from "../state.js";
+import { isPolymarketBot, pinnedDifferences, type BotState } from "../state.js";
 import { Venue, toOrderView } from "../venue.js";
 import { describePublication } from "./config.js";
 import { chainName } from "./init.js";
@@ -37,7 +38,7 @@ export async function status(args: Args, prompts: Prompts): Promise<number> {
   const session = await openSession(args, prompts);
   prompts.close();
   const { bot } = session;
-  if (bot.strategyId === "theme") return (await import("./status-theme.js")).statusTheme(session);
+  if (isPolymarketBot(bot)) return (await import("./status-theme.js")).statusTheme(session);
   const [config, target] = await Promise.all([fetchConfig(session.gateway), fetchTarget(session.gateway)]);
   const now = Date.now();
 
@@ -101,15 +102,17 @@ export async function status(args: Args, prompts: Prompts): Promise<number> {
     const deposits = await venue.netDeposits(Date.parse(bot.createdAt));
     if (deposits.complete) {
       const profit = Math.max(0, snap.equityUsd - deposits.amountUsd);
+      const toSplit = Math.max(0, profit - summary(bot.id).settledUsd);
       row("Profit", `${usd(profit)} (equity ${usd(snap.equityUsd)} less net deposits ${usd(deposits.amountUsd)}, open positions included)`);
-      row("Would pay", `${usd((profit * bot.pinned.split.buybackPct) / 100)} to buy the token, ${usd((profit * bot.pinned.split.keepPct) / 100)} kept`);
+      row("Would pay", `${usd((toSplit * bot.pinned.split.buybackPct) / 100)} to buy the token, ${usd((toSplit * bot.pinned.split.keepPct) / 100)} kept, of ${usd(toSplit)} not yet split`);
+      for (const line of payoutRows(bot.id)) console.log(line);
     } else {
       row("Profit", "not shown: the deposit history could not be read in full");
     }
   } catch (error) {
     row("Profit", `not shown: ${error instanceof Error ? error.message : String(error)}`);
   }
-  console.log("  The buyback is not implemented in v1. Nothing is paid out and no funds leave the wallet.");
+  console.log("  Nothing is paid out by itself. strats buyback shows the plan; strats buyback --execute carries it out, from this machine only.");
 
   console.log("Next cycle");
   const decision = reconcile(toReconcileInput({ ok: true, doc: target.value }, snap, Date.now(), config.ok ? config.value.config.account.positionPct : 0, bot.ceilingPct, true, openBlocked(config.ok ? config.value : undefined, config.ok ? "" : config.message, snap)));

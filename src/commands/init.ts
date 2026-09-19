@@ -1,3 +1,4 @@
+// src/commands/init.ts
 // strats init: the whole install, in one go. Read the settings through the
 // gateway, create the wallet and the keystore, pin the payout settings, fund
 // the wallet, and deploy the runner to a droplet. Every stage after the first
@@ -6,35 +7,51 @@
 // strats fund and strats deploy run.
 import { KeyRoles, generateEoa } from "@quotient-forecasting/cassie-core";
 import { UsageError, type Args } from "../args.js";
-import { DEFAULT_GATEWAY_URL, discoverConfig, fetchConfig, fetchThemeConfig, normalizeGatewayUrl } from "../client.js";
+import { DEFAULT_GATEWAY_URL, discoverConfig, fetchConfigFor, normalizeGatewayUrl } from "../client.js";
 import { STAGE_NAMES, nextInitStage, type InitStage } from "../install.js";
 import { DEFAULT_BOT_ID, assertBotId, ensureHome, keysDir } from "../paths.js";
-import type { AnyConfigDoc } from "../protocol/index.js";
+import { TEAM_BET_MODES, type AnyConfigDoc } from "../protocol/index.js";
 import { VENUE_MIN_NOTIONAL_USD, effectivePct } from "../reconcile.js";
 import { THEME_DEFAULT_MIN_SHARES } from "../reconcile-theme.js";
 import { POLYMARKET_L2_ROLE, openSession, requireKeystore, type KeystoreSession } from "../session.js";
 import { checkPassphrase, makeSetupContext, openKeystore, readPassphrase, type Prompts } from "../setup.js";
-import { API_KEY_ROLE, MAX_POSITION_PCT, botExists, loadBot, saveBot, type BotState } from "../state.js";
+import { API_KEY_ROLE, MAX_POSITION_PCT, botExists, isPolymarketBot, loadBot, saveBot, type BotState } from "../state.js";
 import { buildAdapter } from "../venue.js";
 import { buildPolymarketAdapter } from "../venue-polymarket.js";
 import { PROJECTS_URL, deployBot, watchLines } from "./deploy.js";
 import { fundSession } from "./fund.js";
 
-const CHAIN_NAMES: Record<number, string> = { 1: "Ethereum", 10: "Optimism", 137: "Polygon", 8453: "Base", 42161: "Arbitrum" };
+const CHAIN_NAMES: Record<number, string> = { 1: "Ethereum", 10: "Optimism", 137: "Polygon", 4663: "Robinhood Chain", 8453: "Base", 42161: "Arbitrum" };
 export const chainName = (chainId: number): string => (CHAIN_NAMES[chainId] ? `${CHAIN_NAMES[chainId]} (chain ${chainId})` : `chain ${chainId}`);
+
+function describeStrategy(config: AnyConfigDoc["config"]): string[] {
+  if (config.strategyId === "team") {
+    const { team, mode, marginPts, maxPriceCents } = config.strategy;
+    const bet = TEAM_BET_MODES.find((m) => m.value === mode);
+    return [
+      "  Strategy         Back a team, on Polymarket",
+      `  Team             ${team.name} (${team.league.toUpperCase()})`,
+      `  Bet              ${bet?.label ?? mode}`,
+      ...(bet?.usesMargin ? [`  Lead needed      ${marginPts} point${marginPts === 1 ? "" : "s"}`] : []),
+      `  Pay at most      ${maxPriceCents}¢`,
+    ];
+  }
+  if (config.strategyId === "theme") {
+    return [
+      "  Strategy         Your own theme, on Polymarket",
+      `  Thesis           ${config.strategy.thesis}`,
+      `  Markets          ${config.strategy.markets.length} chosen on TokenStrats`,
+    ];
+  }
+  return [
+    "  Strategy         Single asset, on Hyperliquid",
+    `  Asset            ${config.strategy.assetKey}`,
+  ];
+}
 
 export function describeConfig(doc: AnyConfigDoc): string[] {
   const { account } = doc.config;
-  const head = doc.config.strategyId === "theme"
-    ? [
-      "  Strategy         Your own theme, on Polymarket",
-      `  Thesis           ${doc.config.strategy.thesis}`,
-      `  Markets          ${doc.config.strategy.markets.length} chosen on TokenStrats`,
-    ]
-    : [
-      "  Strategy         Single asset, on Hyperliquid",
-      `  Asset            ${doc.config.strategy.assetKey}`,
-    ];
+  const head = describeStrategy(doc.config);
   return [
     ...head,
     `  Position size    ${account.positionPct}% of the wallet per position`,
@@ -120,14 +137,15 @@ async function setup(args: Args, prompts: Prompts, id: string, gatewayUrl: strin
     ...(previous?.fundedAt ? { fundedAt: previous.fundedAt } : {}),
     publishWallet,
     ceilingPct,
-    pinned: { token: account.token, split: account.split },
+    // A destination pinned with strats buyback --to is this machine's choice, so reading the settings again keeps it.
+    pinned: { token: account.token, split: account.split, ...(previous?.pinned.destination ? { destination: previous.pinned.destination } : {}) },
     // Profit is measured from the wallet's first day, so a re-init keeps the original date.
     createdAt: previous?.createdAt ?? new Date().toISOString(),
   };
   saveBot(bot);
 
   console.log(keptWallet ? "Kept the existing wallet." : "Wallet created.");
-  console.log(strategyId === "theme" ? `  Signing address  ${masterAddress} (signs orders; do not send funds here)` : `  Address          ${masterAddress}`);
+  console.log(isPolymarketBot(bot) ? `  Signing address  ${masterAddress} (signs orders; do not send funds here)` : `  Address          ${masterAddress}`);
   console.log(`  Keystore         ${keysDir()} (encrypted)`);
   console.log(`  Ceiling          ${ceilingPct}% of the wallet per position`);
   console.log(`  Project page     ${publishWallet ? "shows the wallet address, as you chose" : "does not show the wallet address"}. To change it: strats config publish-wallet on|off`);
@@ -136,7 +154,7 @@ async function setup(args: Args, prompts: Prompts, id: string, gatewayUrl: strin
   return { bot, keystore, passphrase, gateway: { gatewayUrl, apiKey } };
 }
 
-/** Theme bots: a deposit wallet owned by the bot's key, API credentials, and the trading approvals. It costs nothing. */
+/** Theme and team bots: a deposit wallet owned by the bot's key, API credentials, and the trading approvals. It costs nothing. */
 async function setupPolymarketAccount(session: KeystoreSession, prompts: Prompts): Promise<number> {
   const { bot, keystore, passphrase } = session;
   console.log("Setting up the Polymarket account. This creates a deposit wallet owned by the key above and approves trading. It costs nothing.");
@@ -158,7 +176,7 @@ async function setupPolymarketAccount(session: KeystoreSession, prompts: Prompts
 async function printFundingInstructions(bot: BotState, positionPct: number | null): Promise<void> {
   const pct = positionPct === null ? null : effectivePct(positionPct, bot.ceilingPct);
   console.log("Fund the wallet");
-  if (bot.strategyId === "theme") {
+  if (isPolymarketBot(bot)) {
     console.log(`  Polymarket deposit wallet  ${bot.polymarket!.funder}`);
     try {
       const instructions = await buildPolymarketAdapter().fundingInstructions({ venue: "polymarket", ...bot.polymarket! });
@@ -182,7 +200,7 @@ function sayLocalRun(bot: BotState): void {
   console.log("To run it on this machine");
   console.log("  strats run --dry-run --once    shows what it would do and sends nothing");
   console.log("  strats run                     the loop; it trades for as long as it stays open");
-  if (bot.strategyId === "theme") console.log("  Polymarket refuses orders from the United States. From there, use strats deploy.");
+  if (isPolymarketBot(bot)) console.log("  Polymarket refuses orders from the United States. From there, use strats deploy.");
   console.log("To put it on a droplet later: strats deploy");
   console.log(`The public project page: ${PROJECTS_URL}`);
 }
@@ -246,7 +264,7 @@ export async function init(args: Args, prompts: Prompts): Promise<number> {
       if (code !== 0) return code;
     } else if (stage === "fund") {
       if (positionPct === null) {
-        const config = session.bot.strategyId === "theme" ? await fetchThemeConfig(session.gateway) : await fetchConfig(session.gateway);
+        const config = await fetchConfigFor(session.bot.strategyId, session.gateway);
         if (config.ok) positionPct = config.value.config.account.positionPct;
       }
       await printFundingInstructions(session.bot, positionPct);

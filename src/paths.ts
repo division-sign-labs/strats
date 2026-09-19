@@ -25,6 +25,12 @@ export const sshDir = (): string => join(homeDir(), "ssh");
 export const botFile = (id: string): string => join(botsDir(), `${assertBotId(id)}.json`);
 export const logFile = (id: string): string => join(logsDir(), `${assertBotId(id)}.log`);
 export const runtimeStateFile = (id: string): string => join(stateDir(), `${assertBotId(id)}.json`);
+/** Every withdrawal and buyback strats buyback has made, one JSON object per line. Only ever appended to. */
+export const payoutsLedgerFile = (id: string): string => join(stateDir(), `${assertBotId(id)}.payouts.jsonl`);
+/** The totals of that record, for the report. Rewritten from the record, and the one payout file a droplet receives. */
+export const payoutsSummaryFile = (id: string): string => join(stateDir(), `${assertBotId(id)}.payouts.json`);
+/** The one buyback in flight, written before each step so a stopped run can be continued without paying twice. */
+export const buybackJournalFile = (id: string): string => join(stateDir(), `${assertBotId(id)}.buyback.json`);
 
 /** mkdir honors the umask and ignores existing directories, so set the mode explicitly. */
 export function ensurePrivateDir(dir: string): void {

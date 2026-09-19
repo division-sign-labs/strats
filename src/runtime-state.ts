@@ -13,6 +13,8 @@ const RuntimeStateSchema = z.object({
   volumeUsd: z.number().nonnegative().default(0),
   /** Polymarket only: the wallet value the runner measures profit from. */
   netDepositsUsd: z.number().optional(),
+  /** Polymarket only: when that figure was taken. A buyback withdrawal made after it is subtracted from it; one made before is already in it. Absent reads as the beginning of time. */
+  netDepositsAt: z.string().optional(),
   lastReportAt: z.string().optional(),
   lastAction: z.string().max(200).optional(),
   /** Theme target id -> when it was entered. A market is entered once. */

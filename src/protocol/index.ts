@@ -6,7 +6,8 @@ import { z } from "zod";
 export const PROTOCOL_VERSION = 1;
 export const STRATEGY_ID = "stock-ls";
 export const THEME_STRATEGY_ID = "theme";
-export const STRATEGY_IDS = [STRATEGY_ID, THEME_STRATEGY_ID] as const;
+export const TEAM_STRATEGY_ID = "team";
+export const STRATEGY_IDS = [STRATEGY_ID, THEME_STRATEGY_ID, TEAM_STRATEGY_ID] as const;
 export type StrategyId = (typeof STRATEGY_IDS)[number];
 
 const isoTime = z.string().refine((value) => Number.isFinite(Date.parse(value)), "not an ISO time");
@@ -75,6 +76,49 @@ export const ThemeConfigDocSchema = z.object({
   }),
 });
 
+/** The leagues a team can come from, and the sport each belongs to. */
+export const TEAM_LEAGUES = ["mlb", "nfl", "epl", "mls", "atp", "wta"] as const;
+export const TEAM_SPORTS = ["baseball", "football", "soccer", "tennis"] as const;
+/** The five ways to bet on a team. The margin modes read the lead in the market, in points. */
+export const TEAM_BET_MODES = [
+  { value: "back", label: "Always back them", usesMargin: false },
+  { value: "against", label: "Always bet against them", usesMargin: false },
+  { value: "follow", label: "Follow the market", usesMargin: true },
+  { value: "back-favored", label: "Back them only when favored", usesMargin: true },
+  { value: "against-favored", label: "Bet against them only when the market does", usesMargin: true },
+] as const;
+export type TeamBetMode = (typeof TEAM_BET_MODES)[number]["value"];
+
+export const TeamStrategySchema = z.object({
+  team: z.object({
+    /** Polymarket's numeric team id, as a string. */
+    id: z.string().min(1).max(12),
+    name: z.string().min(1).max(80),
+    alias: z.string().max(80).nullable().default(null),
+    abbreviation: z.string().max(16).nullable().default(null),
+    league: z.enum(TEAM_LEAGUES),
+    sport: z.enum(TEAM_SPORTS),
+  }),
+  mode: z.enum(["back", "against", "follow", "back-favored", "against-favored"]),
+  /** The lead the favorite needs, in points. Read by the three margin modes only. */
+  marginPts: z.number().int().min(0).max(40),
+  /** Never pay above this, in cents. */
+  maxPriceCents: z.number().int().min(5).max(95),
+});
+
+export const TeamConfigDocSchema = z.object({
+  strategyId: z.literal(TEAM_STRATEGY_ID),
+  version: z.number().int().nonnegative(),
+  updatedAt: isoTime,
+  config: z.object({
+    v: z.literal(PROTOCOL_VERSION),
+    strategyId: z.literal(TEAM_STRATEGY_ID),
+    strategy: TeamStrategySchema,
+    account: AccountSchema,
+    profile: optionalProfile,
+  }),
+});
+
 const probability = z.number().min(0).max(1);
 
 export const ThemeTargetSchema = z.object({
@@ -101,6 +145,24 @@ export const ThemeTargetsSchema = z.object({
   mode: z.enum(["open", "reduce-only"]),
   targets: z.array(ThemeTargetSchema).max(200),
   closed: z.array(z.object({ conditionId: z.string().min(1), tokenId: z.string().min(1), reason: z.string() })).max(200),
+});
+
+/** One game market of the team's. `teamSide` is the index of the outcome that is the team winning. */
+export const TeamMarketSchema = z.object({
+  conditionId: z.string().min(1),
+  tokenIds: tokenPair,
+  outcomes: tokenPair,
+  teamSide: z.union([z.literal(0), z.literal(1)]),
+  question: z.string().max(300),
+  gameStartTime: isoTime,
+  /** Display only, so a state this version cannot read is shown as upcoming rather than failing the document. */
+  state: z.enum(["upcoming", "live", "closed"]).catch("upcoming"),
+});
+
+/** The theme document plus the games it was built from. The literal id keeps a team runner from ever accepting a theme document, and the reverse. */
+export const TeamTargetsSchema = ThemeTargetsSchema.extend({
+  strategyId: z.literal(TEAM_STRATEGY_ID),
+  markets: z.array(TeamMarketSchema).max(60),
 });
 
 /** The report body limit on the gateway, in bytes. A larger report is dropped here rather than sent. */
@@ -186,7 +248,11 @@ export type Token = z.infer<typeof TokenSchema>;
 export type Split = z.infer<typeof SplitSchema>;
 export type ConfigDoc = z.infer<typeof ConfigDocSchema>;
 export type ThemeConfigDoc = z.infer<typeof ThemeConfigDocSchema>;
-export type AnyConfigDoc = ConfigDoc | ThemeConfigDoc;
+export type TeamConfigDoc = z.infer<typeof TeamConfigDocSchema>;
+export type TeamStrategy = z.infer<typeof TeamStrategySchema>;
+export type TeamMarket = z.infer<typeof TeamMarketSchema>;
+export type TeamTargetsDoc = z.infer<typeof TeamTargetsSchema>;
+export type AnyConfigDoc = ConfigDoc | ThemeConfigDoc | TeamConfigDoc;
 export type ThemeMarket = z.infer<typeof ThemeMarketSchema>;
 export type ThemeTarget = z.infer<typeof ThemeTargetSchema>;
 export type ThemeTargetsDoc = z.infer<typeof ThemeTargetsSchema>;
@@ -232,20 +298,59 @@ export function parseThemeConfig(input: unknown): ParseResult<ThemeConfigDoc> {
   return { ok: true, value: parsed.data };
 }
 
+export function parseTeamConfig(input: unknown): ParseResult<TeamConfigDoc> {
+  const parsed = TeamConfigDocSchema.safeParse(input);
+  return parsed.success ? { ok: true, value: parsed.data } : { ok: false, reason: describe(parsed.error) };
+}
+
+/** The identity rules every Polymarket targets document must satisfy: one entry per market, and the id names the market. Null means they hold. */
+function targetsIdentityProblem(doc: Pick<ThemeTargetsDoc, "asOf" | "validUntil" | "targets" | "closed">): string | null {
+  if (Date.parse(doc.validUntil) <= Date.parse(doc.asOf)) return "validUntil is not after asOf";
+  const seen = new Set<string>();
+  for (const target of doc.targets) {
+    if (!target.id.startsWith(`${target.conditionId}:`)) return `target ${target.id} does not name its market`;
+    if (seen.has(target.conditionId)) return `market ${target.conditionId} is targeted twice`;
+    seen.add(target.conditionId);
+  }
+  for (const closed of doc.closed) {
+    if (seen.has(closed.conditionId)) return `market ${closed.conditionId} is both targeted and closed`;
+  }
+  return null;
+}
+
 /** Field checks plus the identity rules every target must satisfy: one entry per market, and the id names the market. */
 export function parseThemeTargets(input: unknown): ParseResult<ThemeTargetsDoc> {
   const parsed = ThemeTargetsSchema.safeParse(input);
   if (!parsed.success) return { ok: false, reason: describe(parsed.error) };
+  const problem = targetsIdentityProblem(parsed.data);
+  return problem === null ? { ok: true, value: parsed.data } : { ok: false, reason: problem };
+}
+
+/**
+ * The theme rules, plus the ones a team document adds: every target is a market-rule bet with an entry
+ * deadline, and every token a target or a closed entry names belongs to a game listed in `markets`.
+ */
+export function parseTeamTargets(input: unknown): ParseResult<TeamTargetsDoc> {
+  const parsed = TeamTargetsSchema.safeParse(input);
+  if (!parsed.success) return { ok: false, reason: describe(parsed.error) };
   const doc = parsed.data;
-  if (Date.parse(doc.validUntil) <= Date.parse(doc.asOf)) return { ok: false, reason: "validUntil is not after asOf" };
-  const seen = new Set<string>();
+  const problem = targetsIdentityProblem(doc);
+  if (problem !== null) return { ok: false, reason: problem };
+  const games = new Map<string, TeamMarket>();
+  for (const market of doc.markets) {
+    const key = market.conditionId.toLowerCase();
+    if (market.tokenIds[0] === market.tokenIds[1]) return { ok: false, reason: `market ${market.conditionId}: the two token ids are the same` };
+    if (games.has(key)) return { ok: false, reason: `market ${market.conditionId} is listed twice` };
+    games.set(key, market);
+  }
+  const listed = (conditionId: string, tokenId: string): boolean => games.get(conditionId.toLowerCase())?.tokenIds.includes(tokenId) === true;
   for (const target of doc.targets) {
-    if (!target.id.startsWith(`${target.conditionId}:`)) return { ok: false, reason: `target ${target.id} does not name its market` };
-    if (seen.has(target.conditionId)) return { ok: false, reason: `market ${target.conditionId} is targeted twice` };
-    seen.add(target.conditionId);
+    if (target.rule !== "market") return { ok: false, reason: `target ${target.id}: a team target follows the market rule` };
+    if (target.expiresAt === null) return { ok: false, reason: `target ${target.id} has no entry deadline` };
+    if (!listed(target.conditionId, target.tokenId)) return { ok: false, reason: `target ${target.id} is not one of the listed games` };
   }
   for (const closed of doc.closed) {
-    if (seen.has(closed.conditionId)) return { ok: false, reason: `market ${closed.conditionId} is both targeted and closed` };
+    if (!listed(closed.conditionId, closed.tokenId)) return { ok: false, reason: `closed market ${closed.conditionId} is not one of the listed games` };
   }
   return { ok: true, value: doc };
 }

@@ -1,14 +1,14 @@
 // strats config [show|accept]: compare the server's settings with the pinned payout settings, and re-pin on request.
 // strats config publish-wallet [on|off]: show or change whether reports carry the wallet address.
 import { UsageError, type Args } from "../args.js";
-import { fetchConfig, fetchThemeConfig } from "../client.js";
+import { fetchConfigFor } from "../client.js";
 import { openSession, requireKeystore } from "../session.js";
 import type { Prompts } from "../setup.js";
-import { pinnedDifferences, saveBot, type BotState } from "../state.js";
+import { isPolymarketBot, pinnedDifferences, saveBot, type BotState } from "../state.js";
 import { chainName, describeConfig } from "./init.js";
 
-/** The address a report would carry: the Hyperliquid wallet, or a theme bot's Polymarket deposit wallet. */
-const publishableAddress = (bot: BotState): string => (bot.strategyId === "theme" ? bot.polymarket?.funder ?? "the Polymarket deposit wallet" : bot.masterAddress);
+/** The address a report would carry: the Hyperliquid wallet, or a theme or team bot's Polymarket deposit wallet. */
+const publishableAddress = (bot: BotState): string => (isPolymarketBot(bot) ? bot.polymarket?.funder ?? "the Polymarket deposit wallet" : bot.masterAddress);
 
 export function describePublication(bot: BotState): string {
   return bot.publishWallet === true
@@ -45,7 +45,7 @@ export async function config(args: Args, prompts: Prompts): Promise<number> {
   const session = requireKeystore(await openSession(args, prompts), "config");
   const { bot } = session;
   if (action === "publish-wallet") return publishWallet(bot, args.positionals[1]);
-  const fetched = bot.strategyId === "theme" ? await fetchThemeConfig(session.gateway) : await fetchConfig(session.gateway);
+  const fetched = await fetchConfigFor(bot.strategyId, session.gateway);
   if (!fetched.ok) {
     console.log(`Could not read the settings. ${fetched.message}`);
     return 1;
@@ -76,7 +76,8 @@ export async function config(args: Args, prompts: Prompts): Promise<number> {
     console.log("Nothing was changed.");
     return 0;
   }
-  saveBot({ ...bot, pinned: { token: server.token, split: server.split } });
+  // A destination pinned with strats buyback --to is not a server setting, so it stays.
+  saveBot({ ...bot, pinned: { ...bot.pinned, token: server.token, split: server.split } });
   console.log("Pinned the server's token and split.");
   return 0;
 }

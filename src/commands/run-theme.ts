@@ -1,11 +1,13 @@
-// strats run for a theme bot: Polymarket markets matching the creator's theme.
-// Each cycle reads the config (cached), the targets, the wallet and the books,
-// asks the pure reconcileTheme function what to do, and does it.
+// strats run for a Polymarket bot: the markets matching the creator's theme, or
+// the games of the creator's team. Each cycle reads the config (cached), the
+// targets, the wallet and the books, asks the pure reconcileTheme function what
+// to do, and does it. The source object says where the settings and targets come
+// from and which markets the bot may trade; everything else is the same loop.
 import type { Args } from "../args.js";
-import { fetchThemeConfig, fetchThemeTargets } from "../client.js";
 import { runLoop } from "../loop.js";
 import { appendLog } from "../paths.js";
-import type { ThemeConfigDoc } from "../protocol/index.js";
+import { sourceFor } from "../polymarket-source.js";
+import type { TeamConfigDoc, ThemeConfigDoc, ThemeMarket } from "../protocol/index.js";
 import { describeThemeDecision, reconcileTheme, themeHoldReason, type ThemeTargetsInput } from "../reconcile-theme.js";
 import { Reporter, polymarketPositions, publishedWalletAddress, toReportTrade } from "../report.js";
 import { appendTrade, loadRuntimeState, saveRuntimeState } from "../runtime-state.js";
@@ -28,6 +30,8 @@ export interface ThemeRunOptions {
 export async function runTheme(_args: Args, session: Session, opts: ThemeRunOptions): Promise<number> {
   const { bot } = session;
   const { dryRun } = opts;
+  const source = sourceFor(bot);
+  const tag = source.label;
   if (!bot.polymarket) throw new Error("This bot has no Polymarket account yet. Run: strats init");
   // Polymarket reads need the signed client, so a dry run loads the credentials too. It gets a venue that refuses every order.
   const creds = loadPolymarketCreds(session);
@@ -42,17 +46,19 @@ export async function runTheme(_args: Args, session: Session, opts: ThemeRunOpti
     if (!deployed) appendLog(bot.id, line);
   };
 
-  let config: ThemeConfigDoc | undefined;
+  let config: ThemeConfigDoc | TeamConfigDoc | undefined;
   let configProblem = "";
   let configAt = 0;
   let warnedVersion: number | undefined;
   let blockedAt = 0;
   let blocked = false;
   let lastSnap: PolymarketSnapshot | undefined;
+  /** The markets of the last cycle that read the targets, for the report. */
+  let lastMarkets: ThemeMarket[] = [];
   let lastAction = "";
   /** An order was acknowledged after the snapshot the report would read, so the early report waits for the next snapshot. */
   let tradedSinceSnapshot = false;
-  const reporter = new Reporter(session.gateway, "theme", bot.id, opts.report && !dryRun);
+  const reporter = new Reporter(session.gateway, source.strategyId, bot.id, opts.report && !dryRun);
 
   const cycle = async (): Promise<string> => {
     const now = Date.now();
@@ -62,13 +68,13 @@ export async function runTheme(_args: Args, session: Session, opts: ThemeRunOpti
       const was = blocked;
       blocked = answer?.blocked === true;
       blockedAt = now;
-      if (blocked && !was) return `theme  Holding. Polymarket does not accept orders from ${answer!.country}. Run strats deploy to place the runner in a region where it can trade. Nothing is opened or closed from here.`;
+      if (blocked && !was) return `${tag}  Holding. Polymarket does not accept orders from ${answer!.country}. Run strats deploy to place the runner in a region where it can trade. Nothing is opened or closed from here.`;
     }
     // Said once. Until the next check the runner idles: nothing is read, opened or closed.
     if (blocked) return "";
 
     if (!config || now - configAt >= CONFIG_REFRESH_MS) {
-      const fetched = await fetchThemeConfig(session.gateway);
+      const fetched = await source.fetchConfig(session.gateway);
       configAt = now;
       if (fetched.ok) {
         config = fetched.value;
@@ -82,16 +88,19 @@ export async function runTheme(_args: Args, session: Session, opts: ThemeRunOpti
       }
     }
 
-    const fetched = await fetchThemeTargets(session.gateway);
-    const targets: ThemeTargetsInput = fetched.ok ? { ok: true, doc: fetched.value } : { ok: false, reason: fetched.message };
+    const fetched = await source.fetchTargets(session.gateway);
     // HOLD needs no venue read: nothing is opened and nothing is closed.
-    if (!targets.ok || themeHoldReason(targets, now) !== null) {
-      return `theme  ${describeThemeDecision(reconcileTheme({ ...EMPTY, targets, now }), dryRun)}`;
-    }
+    const hold = (held: ThemeTargetsInput): string => `${tag}  ${describeThemeDecision(reconcileTheme({ ...EMPTY, targets: held, now }), dryRun)}`;
+    if (!fetched.ok) return hold({ ok: false, reason: fetched.message });
+    // A team bot checks each game against the settings here. A game that fails is left out, so its target is refused below.
+    const allowed = source.marketsFor(config, fetched.value);
+    const targets: ThemeTargetsInput & { ok: true } = { ok: true, doc: allowed.doc };
+    if (themeHoldReason(targets, now) !== null) return hold(targets);
 
-    const markets = config?.config.strategy.markets ?? [];
-    const tokenIds = [...targets.doc.targets.map((t) => t.tokenId), ...targets.doc.closed.map((c) => c.tokenId)];
-    const snap = await venue.snapshot(markets, tokenIds);
+    const { markets } = allowed;
+    lastMarkets = markets;
+    const refusals = allowed.refused.length > 0 ? ` ${allowed.refused.slice(0, 3).join(" ")}` : "";
+    const snap = await venue.snapshot(markets, allowed.quoteTokenIds);
     lastSnap = snap;
     if (tradedSinceSnapshot) {
       // This snapshot shows the position the last order made, so the report that follows this cycle is sent early.
@@ -103,6 +112,7 @@ export async function runTheme(_args: Args, session: Session, opts: ThemeRunOpti
     if (state.netDepositsUsd === undefined && snap.equityUsd > 0) {
       // Polymarket has no deposit history to read. Profit is measured from the first wallet value the runner sees.
       state.netDepositsUsd = snap.equityUsd;
+      state.netDepositsAt = new Date().toISOString();
       saveRuntimeState(bot.id, state);
     }
     const recentlyAttempted = Object.entries(state.attempted).filter(([, at]) => now - Date.parse(at) < UNCERTAIN_COOLDOWN_MS).map(([id]) => id);
@@ -116,7 +126,7 @@ export async function runTheme(_args: Args, session: Session, opts: ThemeRunOpti
       pendingTokenIds: snap.pendingTokenIds,
       ...(config ? {} : { openBlockedReason: `The settings could not be loaded (${configProblem}) Not opening.` }),
     });
-    if (dryRun || decision.actions.length === 0) return `theme  ${describeThemeDecision(decision, dryRun)}`;
+    if (dryRun || decision.actions.length === 0) return `${tag}  ${describeThemeDecision(decision, dryRun)}${refusals}`;
 
     const marketOf = (conditionId: string) => markets.find((m) => m.conditionId.toLowerCase() === conditionId.toLowerCase());
     // The report runs beside the cycle and records its own time in the same file; keep it when saving this copy.
@@ -160,18 +170,18 @@ export async function runTheme(_args: Args, session: Session, opts: ThemeRunOpti
       save();
     }
     lastAction = texts.join(" ");
-    return `theme  ${lastAction}`;
+    return `${tag}  ${lastAction}${refusals}`;
   };
 
-  if (!opts.once) emit(`Started theme bot "${bot.id}" for Polymarket wallet ${bot.polymarket.funder}. ${dryRun ? "Nothing will be signed or sent." : "Orders are live."} Ceiling ${bot.ceilingPct}%.`);
+  if (!opts.once) emit(`Started ${tag} bot "${bot.id}" for Polymarket wallet ${bot.polymarket.funder}. ${dryRun ? "Nothing will be signed or sent." : "Orders are live."} Ceiling ${bot.ceilingPct}%.`);
   return runLoop({
     once: opts.once, intervalSec: opts.intervalSec, emit, cycle,
     stoppedMessage: "Stopped. Positions were left as they are on Polymarket.",
     afterCycle: async (line) => {
-      const failure = await reporter.maybeSend(Date.now(), scrub(lastAction || line.replace(/^theme\s+/, ""), secrets), async () => {
+      const failure = await reporter.maybeSend(Date.now(), scrub(lastAction || line.replace(/^(theme|team)\s+/, ""), secrets), async () => {
         if (!lastSnap) return null;
         const state = loadRuntimeState(bot.id);
-        const markets = config?.config.strategy.markets ?? [];
+        const markets = lastMarkets;
         const configured = new Set(markets.flatMap((m) => m.tokenIds));
         return {
           venue: "polymarket",

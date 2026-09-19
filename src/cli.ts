@@ -8,14 +8,15 @@ const HELP = `strats: run a TokenStrats strategy from your own wallet.
 
 Quotient decides what to hold and serves it as targets. This program holds the
 keys, sizes the positions, and places the orders: one Hyperliquid perp for a
-single-asset strategy, Polymarket markets for a theme strategy. Non-custodial:
-Quotient never holds a key and nothing it receives feeds a decision.
+single-asset strategy, Polymarket markets for a theme strategy, and a team's
+games on Polymarket for a team strategy. Non-custodial: Quotient never holds a
+key and nothing it receives feeds a decision.
 
 Usage
   strats init --key qsk_... [--ceiling N] [--id name] [--gateway url] [--no-deploy] [--region blr1] [-y] [--force]
       The whole install. Read the settings, create the wallet and keystore, pin the payout settings,
       show the address to fund and wait for the deposit, then deploy the runner to a droplet (blr1, Bangalore).
-      A theme key also sets up the Polymarket account. Asks once whether to publish the wallet address; the default is no.
+      A theme or team key also sets up the Polymarket account. Asks once whether to publish the wallet address; the default is no.
       Stop at any point with Ctrl-C and run strats init again: it continues where it stopped and keeps the wallet.
       --no-deploy stops after funding; strats run then runs the bot on this machine. -y accepts the deploy question.
       --region, --size and --from-tarball apply to the deploy step, as in strats deploy.
@@ -24,7 +25,7 @@ Usage
   strats fund [--id name] [--dex name]
       The funding step of init, on its own, and the way to add funds later.
       Single asset: deposit USDC from Arbitrum into Hyperliquid and approve a trading key.
-      Theme: show the deposit address, wait for the credit, verify the trading approvals.
+      Theme and team: show the deposit address, wait for the credit, verify the trading approvals.
   strats run [--id name] [--dry-run] [--once] [--interval 30] [--no-report] [--force-side long|short|flat]
       The loop. One line per cycle. --dry-run sends nothing. --no-report sends no report to Quotient.
       --force-side trades a made-up target for testing (single asset only); without --dry-run it also needs --yes-place-a-real-order.
@@ -43,6 +44,20 @@ Usage
       Wallet, equity, positions, the current targets, settings, and the deployed runner's last lines.
   strats close [--id name] [--coin COIN]
       Close what the bot holds, after a y/N confirm.
+  strats buyback [--id name] [--execute] [--min-usd 25] [--slippage 1] [--max-impact 3] [--dex name]
+      Split the bot's profit as pinned on this machine, withdraw the buyback share to the bot's own wallet, and swap it
+      for your token through LI.FI. Without --execute it is a dry run: it reads everything, fetches a live quote, prints
+      the whole plan, and signs and sends nothing. --execute shows the same plan and always asks y/N; -y does not skip it.
+      A run that stops part-way is continued by running it again. It never pays the same profit twice.
+      Runs on this machine only, never on the droplet. Tokens on Ethereum, Base and Arbitrum.
+      --min-usd (at least 10) is the smallest withdrawal worth the fees. --slippage (at most 5) and --max-impact
+      (at most 10) are percents. --dex names the Hyperliquid dex to take the money from; main is the main dex.
+  strats buyback --to <0x address | wallet> [--id name]
+      Pin the address the bought token goes to, after a y/N confirm. wallet means this bot's own wallet, the default.
+  strats buyback --set-deposits <usd> [--id name]
+      Polymarket bots: record everything ever deposited, on a machine that has no record. Profit is measured from it.
+  strats buyback --sync [--id name]
+      Send the droplet the buyback totals its public report shows. Nothing else is sent.
   strats config [show|accept] [--id name]
       Compare the server's settings with the pinned payout settings. accept re-pins them.
   strats config publish-wallet [on|off] [--id name]
@@ -55,8 +70,10 @@ Environment
   STRATS_API_KEY        API key for init
   DIGITALOCEAN_TOKEN    DigitalOcean API token for init, deploy and destroy
   STRATS_RUNTIME_CREDS  set by strats deploy on the droplet; run uses it instead of a keystore
+  STRATS_RPC_ARBITRUM   Arbitrum RPC for buyback (default https://arb1.arbitrum.io/rpc)
+  STRATS_RPC_POLYGON    Polygon RPC for buyback (default https://polygon.drpc.org)
 
-Exit codes: 0 done, 1 failed, 2 wrong usage, 130 stopped with Ctrl-C at a prompt or a wait.`;
+Exit codes: 0 done, 1 failed, 2 wrong usage, 3 stopped part-way; run it again, 130 stopped with Ctrl-C at a prompt or a wait.`;
 
 
 async function main(): Promise<number> {
@@ -97,6 +114,8 @@ async function main(): Promise<number> {
         return await (await import("./commands/status.js")).status(args, prompts);
       case "close":
         return await (await import("./commands/close.js")).close(args, prompts);
+      case "buyback":
+        return await (await import("./commands/buyback.js")).buyback(args, prompts);
       case "config":
         return await (await import("./commands/config.js")).config(args, prompts);
       default:

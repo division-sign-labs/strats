@@ -12,7 +12,7 @@ import { Reporter, assetLabel, hyperliquidPositions, publishedWalletAddress, toR
 import { appendTrade, loadRuntimeState, saveRuntimeState } from "../runtime-state.js";
 import { loadAgentKey, openSession, scrub, sessionSecrets } from "../session.js";
 import type { Prompts } from "../setup.js";
-import { pinnedDifferences } from "../state.js";
+import { isPolymarketBot, pinnedDifferences } from "../state.js";
 import { Venue, toOrderView, toPositionView, type VenueSnapshot } from "../venue.js";
 
 const CONFIG_REFRESH_MS = 5 * 60_000;
@@ -82,7 +82,7 @@ export async function run(args: Args, prompts: Prompts): Promise<number> {
     throw new Error(`Bot "${bot.id}" is deployed on ${bot.deployment.host}. Running it here too would trade the same wallet twice. Use strats logs or strats status, run strats destroy first, or pass --force if that droplet is gone.`);
   }
   const report = !args.flags.has("no-report");
-  if (bot.strategyId === "theme") {
+  if (isPolymarketBot(bot)) {
     if (forceSide !== undefined) throw new UsageError("--force-side applies to single-asset bots only.");
     prompts.close();
     return (await import("./run-theme.js")).runTheme(args, session, { dryRun, once, intervalSec, report });

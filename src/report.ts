@@ -8,6 +8,7 @@ import {
   REPORT_LABEL_MAX, REPORT_MAX_POSITIONS, REPORT_MAX_TRADES, ReportPositionSchema, ReportTradeSchema,
   type Report, type ReportPosition, type ReportTrade, type StrategyId, type ThemeMarket,
 } from "./protocol/index.js";
+import { depositsLessWithdrawals, readPayoutSummary } from "./payouts.js";
 import { loadRuntimeState, saveRuntimeState } from "./runtime-state.js";
 import type { BotState } from "./state.js";
 
@@ -161,7 +162,7 @@ export function polymarketPositions(
 /** The address a public portfolio page can read, and only when the creator chose to publish it. */
 export function publishedWalletAddress(bot: Pick<BotState, "publishWallet" | "strategyId" | "masterAddress" | "polymarket">): string | undefined {
   if (bot.publishWallet !== true) return undefined;
-  return bot.strategyId === "theme" ? bot.polymarket?.funder : bot.masterAddress;
+  return bot.strategyId !== "stock-ls" ? bot.polymarket?.funder : bot.masterAddress;
 }
 
 export interface ReportFigures {
@@ -169,6 +170,8 @@ export interface ReportFigures {
   equityUsd: number;
   netDepositsUsd: number;
   volumeUsd: number;
+  /** Dollars spent buying the token so far. The Reporter fills it in from the payout totals on this machine. */
+  boughtBackUsd?: number;
   openPositions: number;
   /** What the bot holds, already in report form. Left out when the caller has none to give. */
   positions?: ReportPosition[];
@@ -187,8 +190,7 @@ export function buildReport(figures: ReportFigures, lastAction: string, now: num
     netDepositsUsd: cents(figures.netDepositsUsd),
     profitUsd: cents(figures.equityUsd - figures.netDepositsUsd),
     volumeUsd: cents(Math.max(0, figures.volumeUsd)),
-    // The buyback is not implemented in this release, so nothing has been bought back.
-    boughtBackUsd: 0,
+    boughtBackUsd: cents(Math.max(0, figures.boughtBackUsd ?? 0)),
     openPositions: Math.max(0, Math.trunc(figures.openPositions)),
     lastAction: sanitizeAction(lastAction),
     ...(figures.positions ? { positions: figures.positions.slice(0, REPORT_MAX_POSITIONS) } : {}),
@@ -201,6 +203,18 @@ export function buildReport(figures: ReportFigures, lastAction: string, now: num
 export function totalsOnly(report: Report): Report {
   const { positions: _positions, trades: _trades, walletAddress: _walletAddress, ...totals } = report;
   return totals;
+}
+
+/**
+ * Add what strats buyback has done, read from the totals file next to the runtime state. A missing or damaged file means zeros.
+ * Polymarket has no deposit history, so a buyback withdrawal is taken off the recorded deposits here. Hyperliquid's own history already counts it.
+ */
+export function withPayouts(figures: ReportFigures, botId: string): ReportFigures {
+  const payouts = readPayoutSummary(botId);
+  const netDepositsUsd = figures.venue === "polymarket"
+    ? depositsLessWithdrawals(figures.netDepositsUsd, loadRuntimeState(botId).netDepositsAt, payouts.withdrawals)
+    : figures.netDepositsUsd;
+  return { ...figures, netDepositsUsd, boughtBackUsd: payouts.boughtBackUsd };
 }
 
 export class Reporter {
@@ -232,7 +246,7 @@ export class Reporter {
     try {
       const values = await figures();
       if (!values) return null;
-      const report = buildReport(values, lastAction, now);
+      const report = buildReport(withPayouts(values, this.botId), lastAction, now);
       let result = await postReport(this.gateway, this.strategyId, report);
       let note: string | null = null;
       const extras = report.positions !== undefined || report.trades !== undefined || report.walletAddress !== undefined;

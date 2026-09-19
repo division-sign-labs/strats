@@ -1,7 +1,7 @@
 {
   "name": "@quotient-forecasting/strats",
-  "version": "0.3.0",
-  "description": "Non-custodial runner for TokenStrats: reads declarative targets from Quotient and trades them from your own wallet on Hyperliquid or Polymarket",
+  "version": "0.4.0",
+  "description": "Non-custodial runner for TokenStrats: reads declarative targets from Quotient, trades them from your own wallet on Hyperliquid or Polymarket, and buys your token with the profit",
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
@@ -35,7 +35,9 @@
     "prepack": "npm run build"
   },
   "dependencies": {
+    "@nktkas/hyperliquid": "0.33.3",
     "@quotient-forecasting/cassie-core": "0.4.16",
+    "viem": "2.55.15",
     "zod": "^4.4.3"
   },
   "devDependencies": {

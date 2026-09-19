@@ -2,11 +2,11 @@
 // init walks these stages in one go; stopping at any point and running it
 // again picks up at the first stage that is not finished. Nothing here reads a
 // key, a file or the network.
-import type { BotState } from "./state.js";
+import { isPolymarketBot, type BotState } from "./state.js";
 
 /**
  * setup    read the settings, ask for the ceiling and passphrase, create the wallet
- * account  theme bots: create the Polymarket account the wallet trades from
+ * account  theme and team bots: create the Polymarket account the wallet trades from
  * fund     show the address, wait for the deposit, move it into the venue
  * deploy   put the runner on a droplet
  * done     nothing left to do
@@ -22,7 +22,7 @@ export interface InitFacts {
   force?: boolean;
   /** --no-deploy: stop after funding. */
   noDeploy?: boolean;
-  /** Theme bots: whether the Polymarket API credentials are in the keystore. Unknown counts as stored. */
+  /** Theme and team bots: whether the Polymarket API credentials are in the keystore. Unknown counts as stored. */
   polymarketCredsStored?: boolean;
 }
 
@@ -33,13 +33,13 @@ export interface InitFacts {
  */
 export function isFunded(bot: InitBot): boolean {
   if (bot.fundedAt !== undefined || bot.deployment !== undefined) return true;
-  return bot.strategyId !== "theme" && bot.agentAddress !== undefined;
+  return !isPolymarketBot(bot) && bot.agentAddress !== undefined;
 }
 
 export function nextInitStage(facts: InitFacts): InitStage {
   const { bot } = facts;
   if (!bot || facts.force === true) return "setup";
-  if (bot.strategyId === "theme" && (!bot.polymarket || facts.polymarketCredsStored === false)) return "account";
+  if (isPolymarketBot(bot) && (!bot.polymarket || facts.polymarketCredsStored === false)) return "account";
   if (!isFunded(bot)) return "fund";
   if (facts.noDeploy === true) return "done";
   // A droplet whose runner was never confirmed active is a deploy that was stopped halfway: finish it.

@@ -2,8 +2,8 @@
 // up is the display-only report. Never throws: every failure comes back as a
 // typed result so the run loop can hold instead of crashing.
 import {
-  STRATEGY_ID, encodeReport, THEME_STRATEGY_ID, parseConfig, parseTarget, parseThemeConfig, parseThemeTargets,
-  type AnyConfigDoc, type ConfigDoc, type ParseResult, type Report, type StrategyId, type TargetDoc, type ThemeConfigDoc, type ThemeTargetsDoc,
+  STRATEGY_ID, TEAM_STRATEGY_ID, encodeReport, THEME_STRATEGY_ID, parseConfig, parseTarget, parseTeamConfig, parseTeamTargets, parseThemeConfig, parseThemeTargets,
+  type AnyConfigDoc, type ConfigDoc, type ParseResult, type Report, type StrategyId, type TargetDoc, type TeamConfigDoc, type TeamTargetsDoc, type ThemeConfigDoc, type ThemeTargetsDoc,
 } from "./protocol/index.js";
 
 export const DEFAULT_GATEWAY_URL = "https://quotient-api-gateway.onrender.com";
@@ -103,14 +103,31 @@ export function fetchThemeTargets(opts: GatewayOptions): Promise<FetchResult<The
   return getJson(opts, `/api/v1/strategies/${THEME_STRATEGY_ID}/targets`, parseThemeTargets);
 }
 
+export function fetchTeamConfig(opts: GatewayOptions): Promise<FetchResult<TeamConfigDoc>> {
+  return getJson(opts, `/api/v1/strategies/${TEAM_STRATEGY_ID}/config`, parseTeamConfig);
+}
+
+export function fetchTeamTargets(opts: GatewayOptions): Promise<FetchResult<TeamTargetsDoc>> {
+  return getJson(opts, `/api/v1/strategies/${TEAM_STRATEGY_ID}/targets`, parseTeamTargets);
+}
+
+/** The settings of a bot whose strategy is already known. */
+export function fetchConfigFor(strategyId: StrategyId, opts: GatewayOptions): Promise<FetchResult<AnyConfigDoc>> {
+  return strategyId === TEAM_STRATEGY_ID ? fetchTeamConfig(opts) : strategyId === THEME_STRATEGY_ID ? fetchThemeConfig(opts) : fetchConfig(opts);
+}
+
 /**
  * A key belongs to one strategy, and only the gateway knows which. Ask for the
- * single-asset settings first; a 403 means the key belongs to the other strategy.
+ * single-asset settings first; a 403 means the key belongs to another strategy,
+ * so ask for the theme settings, and after a second 403 for the team settings.
  */
 export async function discoverConfig(opts: GatewayOptions): Promise<FetchResult<AnyConfigDoc>> {
+  const notThisStrategy = (result: FetchResult<AnyConfigDoc>): boolean => !result.ok && result.kind === "auth" && result.status === 403;
   const stock = await fetchConfig(opts);
-  if (stock.ok || stock.kind !== "auth" || stock.status !== 403) return stock;
-  return fetchThemeConfig(opts);
+  if (!notThisStrategy(stock)) return stock;
+  const theme = await fetchThemeConfig(opts);
+  if (!notThisStrategy(theme)) return theme;
+  return fetchTeamConfig(opts);
 }
 
 /**

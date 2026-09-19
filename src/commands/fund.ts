@@ -9,7 +9,7 @@ import { loadRuntimeState, saveRuntimeState } from "../runtime-state.js";
 import type { PolymarketCreds } from "../runtime-creds.js";
 import { loadPolymarketCreds, openSession, requireKeystore, type KeystoreSession } from "../session.js";
 import { makeSetupContext, type Prompts } from "../setup.js";
-import { saveBot } from "../state.js";
+import { isPolymarketBot, saveBot } from "../state.js";
 import { buildAdapter } from "../venue.js";
 import { buildPolymarketAdapter } from "../venue-polymarket.js";
 
@@ -28,7 +28,7 @@ function sayHowToStop(prompts: Prompts, chained: boolean): void {
   console.log("");
 }
 
-/** Theme bots: show the deposit address, wait for the credit, and verify the trading approvals. */
+/** Theme and team bots: show the deposit address, wait for the credit, and verify the trading approvals. */
 async function fundPolymarket(session: KeystoreSession, prompts: Prompts, opts: FundOptions): Promise<number> {
   const { bot } = session;
   if (!bot.polymarket) {
@@ -60,7 +60,7 @@ async function fundPolymarket(session: KeystoreSession, prompts: Prompts, opts: 
     // Profit is measured against what was deposited. Polymarket has no deposit history to read, so it is recorded here.
     const state = loadRuntimeState(bot.id);
     const arrived = before !== undefined ? Math.max(0, after - before) : 0;
-    if (state.netDepositsUsd === undefined) saveRuntimeState(bot.id, { ...state, netDepositsUsd: after });
+    if (state.netDepositsUsd === undefined) saveRuntimeState(bot.id, { ...state, netDepositsUsd: after, netDepositsAt: new Date().toISOString() });
     else if (arrived > 0.01) saveRuntimeState(bot.id, { ...state, netDepositsUsd: state.netDepositsUsd + arrived });
     console.log(`Deposit wallet balance: ${after.toFixed(2)} pUSD.`);
   }
@@ -80,7 +80,7 @@ export async function fund(args: Args, prompts: Prompts): Promise<number> {
 /** The funding step itself, for a session that is already open. It records the result in the bot file and in `session.bot`. */
 export async function fundSession(session: KeystoreSession, args: Args, prompts: Prompts, opts: FundOptions = {}): Promise<number> {
   const { bot } = session;
-  if (bot.strategyId === "theme") return fundPolymarket(session, prompts, opts);
+  if (isPolymarketBot(bot)) return fundPolymarket(session, prompts, opts);
 
   // The asset decides the venue account: main-dex coins trade from the main account, HIP-3 coins from their own dex.
   let dex = args.values.dex === "main" ? "" : args.values.dex;

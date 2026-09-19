@@ -3,7 +3,7 @@
 // reads it from STRATS_RUNTIME_CREDS when present. It never contains the
 // keystore, the passphrase, or a Hyperliquid master key.
 import { z } from "zod";
-import { BotStateSchema, type BotState } from "./state.js";
+import { BotStateSchema, isPolymarketBot, type BotState } from "./state.js";
 
 export const RUNTIME_CREDS_ENV = "STRATS_RUNTIME_CREDS";
 
@@ -45,14 +45,14 @@ export interface RuntimeCredsInput {
  */
 export function buildRuntimeCreds(input: RuntimeCredsInput): RuntimeCredsDoc {
   const { deployment: _deployment, ...botState } = input.bot;
-  if (input.bot.strategyId === "theme" ? !input.polymarket : !input.hyperliquid) {
+  if (isPolymarketBot(input.bot) ? !input.polymarket : !input.hyperliquid) {
     throw new Error("The trading credentials for this bot's venue are missing. Run strats fund first.");
   }
   return RuntimeCredsSchema.parse({
     apiKey: input.apiKey,
     gatewayUrl: input.gatewayUrl,
     botState,
-    ...(input.bot.strategyId === "theme"
+    ...(isPolymarketBot(input.bot)
       ? { polymarket: input.polymarket }
       : { hyperliquid: { agentPk: input.hyperliquid!.agentPk, masterAddress: input.hyperliquid!.masterAddress } }),
   });

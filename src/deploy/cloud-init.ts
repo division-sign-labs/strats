@@ -11,6 +11,9 @@ export const RUNNER_PACKAGE = "@quotient-forecasting/strats";
 export const READY_MARKER = "/var/lib/strats/.provisioned";
 export const UNIT_PATH = "/etc/systemd/system/strats@.service";
 export const ENV_DIR = "/etc/strats";
+/** STRATS_HOME on the droplet, owned by the service user. */
+export const RUNNER_HOME = "/var/lib/strats";
+export const RUNNER_OWNER = "strats:strats";
 export const envPath = (botId: string): string => `${ENV_DIR}/${botId}.env`;
 
 /** Monthly list prices in USD for the sizes people pick. The DigitalOcean API's own number is printed once the droplet exists. */
@@ -34,7 +37,7 @@ Type=simple
 User=strats
 Group=strats
 EnvironmentFile=${ENV_DIR}/%i.env
-Environment=STRATS_HOME=/var/lib/strats
+Environment=STRATS_HOME=${RUNNER_HOME}
 Environment=STRATS_RUNNER_VERSION=${runnerVersion}
 ExecStart=/usr/bin/strats run --id %i
 Restart=always

@@ -1,21 +1,46 @@
 // strats close: cancel our exits by id and close the position with a reduce-only order, after a y/N confirm.
 import type { Args } from "../args.js";
-import { fetchTarget } from "../client.js";
-import { dexOfCoin } from "../protocol/index.js";
-import { px } from "../reconcile.js";
-import { fetchThemeConfig } from "../client.js";
+import { fetchTarget, fetchTeamTargets } from "../client.js";
+import { sourceFor } from "../polymarket-source.js";
+import { dexOfCoin, type ThemeMarket } from "../protocol/index.js";
+import { px, usd } from "../reconcile.js";
 import { loadAgentKey, loadPolymarketCreds, openSession, scrub, sessionSecrets, type Session } from "../session.js";
 import type { Prompts } from "../setup.js";
+import { isPolymarketBot } from "../state.js";
+import { teamMarketsForCycle } from "../team-markets.js";
 import { Venue } from "../venue.js";
 import { PolymarketVenue, polymarketGeoblock } from "../venue-polymarket.js";
 
-/** Theme bots: sell every position in a configured market at the bid. Positions in other markets are left alone. */
+/** The markets a close may sell from, or a sentence saying why they could not be read. */
+async function closableMarkets(session: Session): Promise<{ ok: true; markets: ThemeMarket[] } | { ok: false; message: string }> {
+  const source = sourceFor(session.bot);
+  const config = await source.fetchConfig(session.gateway);
+  if (!config.ok) return { ok: false, message: `Could not read the ${source.strategyId === "team" ? "settings" : "configured markets"}. ${config.message}` };
+  if (config.value.config.strategyId === "theme") return { ok: true, markets: config.value.config.strategy.markets };
+  // A team bot has no list of its own: its markets are the team's games, named by the targets document.
+  const targets = await fetchTeamTargets(session.gateway);
+  if (!targets.ok) return { ok: false, message: `Could not read the team's games. ${targets.message}` };
+  // Every game that names the team may be sold from, whatever the targets say about it right now.
+  return { ok: true, markets: teamMarketsForCycle({ ...targets.value, targets: [] }, config.value.config.strategy).markets };
+}
+
+/** Theme and team bots: sell every position in one of the bot's markets at the bid. Positions in other markets are left alone. */
 async function closeTheme(session: Session, prompts: Prompts): Promise<number> {
   const { bot } = session;
   if (!bot.polymarket) throw new Error("This bot has no Polymarket account yet.");
-  const config = await fetchThemeConfig(session.gateway);
-  if (!config.ok) {
-    console.log(`Could not read the configured markets. ${config.message} Nothing was changed.`);
+  const readable = await closableMarkets(session);
+  if (!readable.ok) {
+    console.log(`${readable.message} Nothing was changed.`);
+    if (bot.strategyId !== "team") return 1;
+    // Without the games nothing can be sold safely, but what the venue lists can still be shown.
+    try {
+      const snap = await new PolymarketVenue(bot.polymarket, loadPolymarketCreds(session), { readOnly: true }).snapshot([], []);
+      for (const h of snap.holdings) console.log(`Held: ${h.size} shares worth ${usd(h.valueUsd)}: ${h.label ?? h.tokenId}`);
+      if (snap.holdings.length === 0) console.log("Polymarket lists no positions for this wallet. A position in a game labelled with team names shows up only once the games can be read.");
+    } catch {
+      console.log("The wallet could not be read either.");
+    }
+    console.log("Try again shortly. The wallet can also be managed on polymarket.com.");
     return 1;
   }
   const geo = await polymarketGeoblock();
@@ -23,13 +48,13 @@ async function closeTheme(session: Session, prompts: Prompts): Promise<number> {
     console.log(`Polymarket does not accept orders from ${geo.country}, so positions cannot be sold from here. Nothing was changed.`);
     return 1;
   }
-  const markets = config.value.config.strategy.markets;
+  const { markets } = readable;
   const creds = loadPolymarketCreds(session);
   const venue = new PolymarketVenue(bot.polymarket, creds);
   const snap = await venue.snapshot(markets, markets.flatMap((m) => m.tokenIds));
   const ours = snap.holdings.filter((h) => markets.some((m) => m.tokenIds.includes(h.tokenId)));
   if (ours.length === 0) {
-    console.log("There are no positions in the configured markets.");
+    console.log(bot.strategyId === "team" ? "There are no positions in the team's games." : "There are no positions in the configured markets.");
     return 0;
   }
   for (const h of ours) console.log(`Position: ${h.size} shares, bid ${snap.quotes[h.tokenId]?.bid ?? "none"}: ${markets.find((m) => m.tokenIds.includes(h.tokenId))?.question ?? h.tokenId}`);
@@ -58,7 +83,7 @@ async function closeTheme(session: Session, prompts: Prompts): Promise<number> {
 export async function close(args: Args, prompts: Prompts): Promise<number> {
   const session = await openSession(args, prompts);
   const { bot } = session;
-  if (bot.strategyId === "theme") return closeTheme(session, prompts);
+  if (isPolymarketBot(bot)) return closeTheme(session, prompts);
   const agentPk = loadAgentKey(session);
 
   // The target names the coin. --coin covers the case where the gateway cannot be reached and you still want out.

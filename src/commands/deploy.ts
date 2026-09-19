@@ -17,13 +17,14 @@ import { ensureDigitalOceanReady, publicIpv4, type Droplet } from "../deploy/dig
 import { remoteWriteCommand } from "../deploy/remote-write.js";
 import { ensureKeypair, forgetHostKey, pinHostKey, restrictedChildEnv, scpTo, sshExec, sshExecOrThrow, type Target } from "../deploy/ssh.js";
 import { ensureHome } from "../paths.js";
+import { pushPayoutSummary } from "../payouts.js";
 import { RUNTIME_CREDS_ENV, buildRuntimeCreds, encodeRuntimeCreds } from "../runtime-creds.js";
 import { loadAgentKey, loadPolymarketCreds, openSession, requireKeystore, runtimeCredsPresent, type KeystoreSession } from "../session.js";
 import type { Prompts } from "../setup.js";
-import { loadBot, resolveBotId, saveBot, type BotState } from "../state.js";
+import { isPolymarketBot, loadBot, resolveBotId, saveBot, type BotState } from "../state.js";
 import { packageRoot, packageVersion } from "../version.js";
 
-/** Polymarket refuses orders from the United States, so a theme bot is never placed there. */
+/** Polymarket refuses orders from the United States, so a theme or team bot is never placed there. */
 export const US_REGION_SLUGS = ["nyc1", "nyc2", "nyc3", "sfo1", "sfo2", "sfo3", "atl1"];
 
 /** Plain names for the regions people pick. Any other slug is shown as it is. */
@@ -34,6 +35,12 @@ const REGION_NAMES: Record<string, string> = {
 export const regionLabel = (slug: string): string => (REGION_NAMES[slug] ? `${slug} (${REGION_NAMES[slug]})` : slug);
 
 export const PROJECTS_URL = "https://tokenstrats.xyz/projects";
+
+const STRATEGY_DESCRIPTIONS: Record<BotState["strategyId"], string> = {
+  "stock-ls": "single asset, on Hyperliquid",
+  theme: "your own theme, on Polymarket",
+  team: "back a team, on Polymarket",
+};
 
 /** How to watch a deployed bot. Printed by deploy, and so by init. */
 export function watchLines(bot: BotState): string[] {
@@ -60,7 +67,7 @@ export function monthlyCost(size: string): string {
 /** What the droplet receives, in plain words. Shown before anything is created. */
 export function disclosure(bot: BotState): string[] {
   const common = ["the API key", `this bot's settings file, which holds addresses, percentages and your choice about publishing the wallet (${bot.publishWallet === true ? "published" : "not published"}), and nothing secret`];
-  if (bot.strategyId === "theme") {
+  if (isPolymarketBot(bot)) {
     return [
       `Sent to the droplet over ssh: ${common.join("; ")}; the Polymarket wallet key and its API credentials.`,
       "Polymarket signs every order with the wallet's own key, so there is no trading-only key to send instead. Whoever controls the droplet controls the funds in this Polymarket wallet. Keep only what the bot needs in it.",
@@ -74,7 +81,7 @@ export function disclosure(bot: BotState): string[] {
 }
 
 function readiness(bot: BotState): string | null {
-  if (bot.strategyId === "theme") return bot.polymarket ? null : "This bot has no Polymarket account yet. Run: strats init";
+  if (isPolymarketBot(bot)) return bot.polymarket ? null : "This bot has no Polymarket account yet. Run: strats init";
   return bot.agentAddress ? null : "This bot has no approved trading key yet. Run: strats fund";
 }
 
@@ -124,7 +131,7 @@ function writeRemote(target: Target, path: string, content: string, mode: string
 }
 
 function printPlan(bot: BotState, region: string, size: string, version: string, source: string): void {
-  console.log(`Deploy bot "${bot.id}" (${bot.strategyId === "theme" ? "your own theme, on Polymarket" : "single asset, on Hyperliquid"})`);
+  console.log(`Deploy bot "${bot.id}" (${STRATEGY_DESCRIPTIONS[bot.strategyId]})`);
   console.log(`  Droplet          ${dropletName(bot.id)}, ${DROPLET_IMAGE}`);
   console.log(`  Region           ${regionLabel(region)}`);
   console.log(`  Size             ${size}, ${monthlyCost(size)}`);
@@ -148,7 +155,7 @@ export async function deployBot(args: Args, prompts: Prompts, open?: KeystoreSes
   if (!/^[a-z0-9-]{2,40}$/.test(region) || !/^[a-z0-9-]{2,60}$/.test(size)) throw new Error("--region and --size take DigitalOcean slugs such as blr1 and s-1vcpu-1gb.");
   const bot = open?.bot ?? loadBot(resolveBotId(args.values.id));
   const version = packageVersion();
-  if (bot.strategyId === "theme" && US_REGION_SLUGS.includes(region)) {
+  if (isPolymarketBot(bot) && US_REGION_SLUGS.includes(region)) {
     throw new Error(`Polymarket refuses orders from the United States, and ${region} is a US region. Choose another, for example --region ${DEFAULT_REGION}.`);
   }
 
@@ -196,7 +203,7 @@ export async function deployBot(args: Args, prompts: Prompts, open?: KeystoreSes
     apiKey: session.gateway.apiKey,
     gatewayUrl: session.gateway.gatewayUrl,
     bot,
-    ...(bot.strategyId === "theme"
+    ...(isPolymarketBot(bot)
       ? { polymarket: loadPolymarketCreds(session) }
       : { hyperliquid: { agentPk: loadAgentKey(session), masterAddress: bot.masterAddress } }),
   }));
@@ -279,6 +286,9 @@ export async function deployBot(args: Args, prompts: Prompts, open?: KeystoreSes
   const { pending: _pending, ...confirmed } = saved.deployment!;
   saved = { ...saved, deployment: { ...confirmed, deployedAt: new Date().toISOString() } };
   saveBot(saved);
+  // The buyback totals for the public report: two numbers and a list of dates, no secret. Best effort, and it never fails the deploy.
+  const payouts = pushPayoutSummary(saved);
+  if (!payouts.pushed && payouts.reason === "failed") console.log("The droplet was not told about earlier buybacks, so the public totals will lag. To send them: strats buyback --sync");
   console.log("");
   console.log(`The runner is active on ${host} (${regionLabel(droplet.region.slug)}, ${droplet.size_slug}).`);
   console.log(`Cost: $${droplet.size?.price_monthly ?? SIZE_MONTHLY_USD[size] ?? "?"} per month, billed by DigitalOcean until you run strats destroy.`);

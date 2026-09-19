@@ -28,13 +28,13 @@ export const BotStateSchema = z.object({
   v: z.literal(1),
   id: z.string(),
   /** Bots created before 0.2.0 have no field and are single-asset bots. */
-  strategyId: z.enum(["stock-ls", "theme"]).default("stock-ls"),
+  strategyId: z.enum(["stock-ls", "theme", "team"]).default("stock-ls"),
   gatewayUrl: z.string().min(1),
   /** First 12 characters of the API key, for recognition only. */
   keyPrefix: z.string().max(12),
   masterAddress: address,
   agentAddress: address.optional(),
-  /** Theme bots: the Polymarket account. masterAddress is its signer; funder is the deposit wallet that holds the funds. */
+  /** Theme and team bots: the Polymarket account. masterAddress is its signer; funder is the deposit wallet that holds the funds. */
   polymarket: z.object({ signerAddress: address, funder: address, signatureType: z.number().int() }).optional(),
   deployment: DeploymentSchema.optional(),
   /** When strats fund last finished. Bots funded before 0.3.0 have no field. */
@@ -45,11 +45,18 @@ export const BotStateSchema = z.object({
    */
   publishWallet: z.boolean().optional(),
   ceilingPct: z.number().positive().max(MAX_POSITION_PCT),
-  pinned: z.object({ token: TokenSchema, split: SplitSchema }),
+  /**
+   * Where a payout goes. `destination` is set only by strats buyback --to; without it the bought token goes to this bot's own wallet.
+   * Like the token and the split, it is read from this file and never from the server.
+   */
+  pinned: z.object({ token: TokenSchema, split: SplitSchema, destination: address.optional() }),
   createdAt: z.string(),
 });
 export type BotState = z.infer<typeof BotStateSchema>;
 export type Pinned = BotState["pinned"];
+
+/** Theme and team bots trade on Polymarket from a deposit wallet; a single-asset bot trades on Hyperliquid. */
+export const isPolymarketBot = (bot: Pick<BotState, "strategyId">): boolean => bot.strategyId !== "stock-ls";
 
 export function botExists(id: string): boolean {
   return existsSync(botFile(id));

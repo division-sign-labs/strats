@@ -2,12 +2,13 @@
 
 `strats` runs a TokenStrats strategy from your own wallet. Quotient decides what to hold and serves it as declarative targets; this program holds the keys, sizes the positions, and places the orders. It keeps no trading state of its own: every cycle it reads the targets and the venue from scratch and converges, so downtime, restarts and missed updates need no replay.
 
-There are two strategies. The API key you copy from TokenStrats belongs to one of them, and `strats init` works out which.
+There are three strategies. The API key you copy from TokenStrats belongs to one of them, and `strats init` works out which. `strats buyback` spends a bot's profit on your token; see "Buyback".
 
 | Strategy | Venue | What it holds |
 |---|---|---|
 | Single asset (`stock-ls`) | Hyperliquid | One perpetual, long or short, with a stop and a target resting on the venue |
 | Your own theme (`theme`) | Polymarket | Shares in the markets you chose for your theme, each bought once and sold at a take-profit price or when the market closes |
+| Back a team (`team`) | Polymarket | One side of your team's next game, bought once before the game starts and held to the final whistle. See "Back a team" |
 
 ## Install
 
@@ -17,10 +18,10 @@ Node 22 or newer. One command takes you from an API key to a runner that trades 
 npx @quotient-forecasting/strats init --key qsk_...
 ```
 
-It works the same way for both strategies, and goes through these steps in order:
+It works the same way for every strategy, and goes through these steps in order:
 
 1. **Settings.** Reads the settings you saved on TokenStrats and shows them. Asks for your local ceiling, whether to publish the wallet address (the default is no), and a keystore passphrase.
-2. **Wallet.** Creates the wallet on this machine and encrypts its keys. For a theme key it also creates the Polymarket account the wallet trades from, which costs nothing.
+2. **Wallet.** Creates the wallet on this machine and encrypts its keys. For a theme or team key it also creates the Polymarket account the wallet trades from, which costs nothing.
 3. **Funding.** Shows the address and what to send, waits for the deposit, and moves it into the venue. You are asked before each transfer.
 4. **Deploy.** Puts the runner on a DigitalOcean droplet in your own account, in region `blr1` (Bangalore). It shows the plan, the monthly cost and exactly what will be sent to the droplet, and asks before creating anything.
 5. **Watching it.** Prints how to follow the bot: `strats status`, `strats logs`, and the public project page at https://tokenstrats.xyz/projects.
@@ -34,7 +35,7 @@ Flags for the deploy step:
 | Flag | Effect |
 |---|---|
 | `--no-deploy` | Stop after funding. `strats run` then runs the bot on this machine, and `strats deploy` puts it on a droplet later. |
-| `--region slug` | A DigitalOcean region other than `blr1`. A theme bot is refused a US region, because Polymarket refuses orders from there. |
+| `--region slug` | A DigitalOcean region other than `blr1`. A theme or team bot is refused a US region, because Polymarket refuses orders from there. |
 | `-y` | Accept the deploy question without being asked. The plan, the cost and what reaches the droplet are still printed first. |
 
 To install it once and type `strats` from then on:
@@ -53,11 +54,14 @@ This is everything the program sends:
 
 | To | What | When |
 |---|---|---|
-| Quotient gateway | `GET` requests for the config and the targets, with the API key in the `x-quotient-api-key` header. No body. | `init`, `run`, `status`, `config`, `fund`, `close` |
+| Quotient gateway | `GET` requests for the config and the targets, with the API key in the `x-quotient-api-key` header. No body. | `init`, `run`, `status`, `config`, `fund`, `close`; `buyback` for a single-asset bot, to learn the Hyperliquid dex, unless `--dex` is given |
 | Quotient gateway | The report: one `POST` at most every 5 minutes, and one soon after an order. See "The report". | `run`, unless `--dry-run` or `--no-report` |
 | Hyperliquid API | Read queries keyed by the wallet's public address. Orders, cancels and the leverage setting, signed locally by the trading key. | single-asset bots: `run`, `status`, `close` |
 | Hyperliquid API and an Arbitrum RPC | Balance reads, the USDC deposit transaction, the trading-key approval and the account setup, signed locally by the master key. | single-asset bots: the funding step only (`init`, `fund`) |
-| Polymarket APIs and a Polygon RPC | Account setup, trading approvals, balance, position and book reads, orders and redemptions, signed locally by the wallet key. One request to `polymarket.com/api/geoblock`. | theme bots: `init`, `fund`, `run`, `status`, `close` |
+| Polymarket APIs and a Polygon RPC | Account setup, trading approvals, balance, position and book reads, orders and redemptions, signed locally by the wallet key. One request to `polymarket.com/api/geoblock`. | theme and team bots: `init`, `fund`, `run`, `status`, `close` |
+| Hyperliquid or Polymarket | Balance and history reads. With `--execute`, one withdrawal to the bot's own wallet, signed locally by the wallet key. | `buyback` |
+| LI.FI (`li.quest`) | A quote request carrying the wallet address, the destination address, the two tokens and the amount. After a swap, status requests carrying the transaction hash. | `buyback` |
+| An Arbitrum or Polygon RPC | Balance, allowance and nonce reads for the wallet address. With `--execute`, the signed approval and swap transactions. | `buyback` |
 | DigitalOcean API | Create, read and delete the droplet, its ssh key and its firewall, with your DigitalOcean token. | `init`, `deploy`, `destroy` |
 | Your droplet, over ssh | The runner and the credentials it needs. See "What reaches the droplet". | `init`, `deploy`, `status`, `logs`, `destroy` |
 | npm registry | One `npm view` to learn whether this version is published. | `init`, `deploy` |
@@ -87,7 +91,7 @@ That is everything a report can contain. Besides the API key, it is the only thi
 |---|---|
 | `v`, `at`, `venue` | The format version, the time, and `hyperliquid` or `polymarket`. |
 | `equityUsd`, `netDepositsUsd`, `profitUsd`, `volumeUsd`, `openPositions` | The totals. Profit is equity less net deposits. |
-| `boughtBackUsd` | Always 0: this release has no buyback. |
+| `boughtBackUsd` | Dollars `strats buyback` has spent on your token, finished swaps only. 0 until the first one. See "Buyback". |
 | `lastAction` | The runner's last log sentence, cut to 200 characters. |
 | `positions` | What the bot holds, at most 20, largest first. `label` is the asset's name for Hyperliquid (the coin's ticker when it has no known name) or the market question for Polymarket, at most 80 characters. `side` is `long`, `short`, or the outcome bought, such as `Yes`. `sizeUsd` is the current value. `entryPrice`, `markPrice` and `pnlUsd` are `null` when the venue did not give the number. They come from the venue reading the cycle already made; the report causes no extra reads. |
 | `trades` | The last 30 orders this runner had acknowledged, newest first: `open` and `close` on Hyperliquid, `buy`, `sell` and `redeem` on Polymarket, with the time, the same kind of label, the dollar size and the price (`null` for a redemption, or when the venue gave none). A stop or target that fills on the venue while the runner is idle is not in this list, because the runner did not send it. |
@@ -105,7 +109,7 @@ By default the report carries no address, and the project page shows only what t
 Show this bot's trades on its public project page? The wallet address becomes public. [y/N]
 ```
 
-If you answer yes, each report also carries `walletAddress`: the Hyperliquid wallet address for a single-asset bot, or the Polymarket deposit wallet for a theme bot. A theme bot's signing address is never sent. A public address lets anyone look up everything that wallet holds and has done on the venue, not only what this bot did. The answer is stored as `publishWallet` in the bot file, which is not a secret, and travels to the droplet inside the settings so the deployed runner follows it.
+If you answer yes, each report also carries `walletAddress`: the Hyperliquid wallet address for a single-asset bot, or the Polymarket deposit wallet for a theme or team bot. A Polymarket bot's signing address is never sent. A public address lets anyone look up everything that wallet holds and has done on the venue, not only what this bot did. The answer is stored as `publishWallet` in the bot file, which is not a secret, and travels to the droplet inside the settings so the deployed runner follows it.
 
 To see or change it later:
 
@@ -119,9 +123,9 @@ A deployed runner keeps the choice it was deployed with until you run `strats de
 
 ### Keys
 
-A single-asset bot's keystore holds three entries: the master key (owns the funds, used only by `fund`), the trading key (an approved Hyperliquid agent that can trade but cannot withdraw, used by `run` and `close`), and the API key.
+A single-asset bot's keystore holds three entries: the master key (owns the funds, used only by `fund` and `buyback --execute`), the trading key (an approved Hyperliquid agent that can trade but cannot withdraw, used by `run` and `close`), and the API key.
 
-A theme bot's keystore holds the wallet key, the Polymarket API credentials, and the API key. Polymarket has no trading-only key: its SDK signs every order with the wallet's own key, and that key controls the deposit wallet that holds the funds. `run`, `status` and `close` therefore load it. Keep only what the bot needs in that wallet.
+A theme or team bot's keystore holds the wallet key, the Polymarket API credentials, and the API key. Polymarket has no trading-only key: its SDK signs every order with the wallet's own key, and that key controls the deposit wallet that holds the funds. `run`, `status` and `close` therefore load it. Keep only what the bot needs in that wallet.
 
 The bot file next to the keystore holds only addresses and settings.
 
@@ -136,21 +140,25 @@ strats logs [--id name] [--lines 50] [--follow]
 strats destroy [--id name] [-y]
 strats status [--id name]
 strats close [--id name] [--coin COIN]
+strats buyback [--id name] [--execute] [--min-usd 25] [--slippage 1] [--max-impact 3] [--dex name]
+strats buyback --to <0x address | wallet> [--id name]
+strats buyback --set-deposits <usd> [--id name]
+strats buyback --sync [--id name]
 strats config [show|accept] [--id name]
 strats config publish-wallet [on|off] [--id name]
 ```
 
-**init** is the whole install, described under "Install". It reads your saved settings through the gateway and shows them, asks for your local ceiling, whether to publish the wallet address, and a keystore passphrase, creates the wallet, stores the API key encrypted, and pins the payout settings. For a theme key it also sets up the Polymarket account (a deposit wallet owned by the new key, API credentials, and the trading approvals, none of which cost anything). Then it runs the funding step and the deploy step, which are the same code as `fund` and `deploy`, and it asks for the passphrase only once. The key can also come from `STRATS_API_KEY` or a hidden prompt, which keeps it out of shell history.
+**init** is the whole install, described under "Install". It reads your saved settings through the gateway and shows them, asks for your local ceiling, whether to publish the wallet address, and a keystore passphrase, creates the wallet, stores the API key encrypted, and pins the payout settings. For a theme or team key it also sets up the Polymarket account (a deposit wallet owned by the new key, API credentials, and the trading approvals, none of which cost anything). Then it runs the funding step and the deploy step, which are the same code as `fund` and `deploy`, and it asks for the passphrase only once. The key can also come from `STRATS_API_KEY` or a hidden prompt, which keeps it out of shell history.
 
 Run again on a bot that exists, `init` continues from the first unfinished step and keeps the wallet; when every step is finished it says so and changes nothing. `--force` reads the settings again and replaces them, still keeping the wallet, your answer about publishing it, and the date profit is measured from. A key that belongs to a different bot is refused: use `--id` to create a second bot. `--no-deploy` stops after funding. `--region`, `--size`, `--from-tarball` and `-y` apply to the deploy step. `init` needs a terminal, because the funding step asks before each transfer.
 
 **fund** is the funding step on its own. **fund**, single asset: waits for USDC on Arbitrum, deposits it into Hyperliquid, and approves the trading key. It asks before each transfer. It deposits the wallet's whole USDC balance. The wallet needs a little ETH on Arbitrum for gas. Deposits under 5 USDC are lost by the Hyperliquid bridge. For HIP-3 assets (coins like `xyz:NVDA`) it also sets Standard account mode and moves the deposit to that dex.
 
-**fund**, theme: shows the address to send USDC to, waits for Polymarket's bridge to credit the deposit wallet, and checks the trading approvals. No gas is needed.
+**fund**, theme and team: shows the address to send USDC to, waits for Polymarket's bridge to credit the deposit wallet, and checks the trading approvals. No gas is needed.
 
-**run** is the loop. Each cycle it fetches the config (cached for 5 minutes) and the targets, reads the account and the market from the venue, decides, acts, and prints one line saying what it did and why. `--dry-run` sends nothing and says what it would do. For a single-asset bot a dry run loads no signing key at all; for a theme bot it loads the credentials, because Polymarket's balance and position reads need them, and hands them to a venue object that refuses every order. `--once` runs one cycle. On an error it prints one line, doubles the wait up to 5 minutes, and continues. Ctrl-C or SIGTERM exits without touching positions. `run` refuses to start while the bot is deployed, because two runners would trade the same wallet twice; `--force` overrides that if the droplet is gone.
+**run** is the loop. Each cycle it fetches the config (cached for 5 minutes) and the targets, reads the account and the market from the venue, decides, acts, and prints one line saying what it did and why. `--dry-run` sends nothing and says what it would do. For a single-asset bot a dry run loads no signing key at all; for a theme or team bot it loads the credentials, because Polymarket's balance and position reads need them, and hands them to a venue object that refuses every order. `--once` runs one cycle. On an error it prints one line, doubles the wait up to 5 minutes, and continues. Ctrl-C or SIGTERM exits without touching positions. `run` refuses to start while the bot is deployed, because two runners would trade the same wallet twice; `--force` overrides that if the droplet is gone.
 
-Polymarket refuses orders from the United States and some other countries. A theme bot checks once at start; when it is blocked it prints one sentence naming `strats deploy`, then idles and checks again every 15 minutes. It opens and closes nothing from a blocked location.
+Polymarket refuses orders from the United States and some other countries. A theme or team bot checks once at start; when it is blocked it prints one sentence naming `strats deploy`, then idles and checks again every 15 minutes. It opens and closes nothing from a blocked location.
 
 `--force-side` (single asset only) replaces Q's target with a made-up one built from the live price (target 2% away, stop 1.5% the other way, entry limit halfway, expires in 1 hour) so you can test while Q is neutral. It is free to use with `--dry-run`. Without `--dry-run` it places a real order and also requires `--yes-place-a-real-order`.
 
@@ -160,13 +168,17 @@ Polymarket refuses orders from the United States and some other countries. A the
 
 **destroy** stops the runner and deletes the droplet and its firewall, after a y/N confirm. Positions and resting orders stay on the venue as they are. Billing for the droplet stops.
 
-**status** shows the wallet, equity, positions, the current targets and whether they are fresh, the config version, your ceiling, the pinned payout settings, the profit split it would pay, and, for a deployed bot, whether the service is active and its last 20 log lines, read over ssh with `journalctl -u strats@<id> -n 20 --no-pager`.
+**status** shows the wallet, equity, positions, the current targets and whether they are fresh, the config version, your ceiling, the pinned payout settings, the profit not yet split and what a buyback would pay, what was bought back so far, and, for a deployed bot, whether the service is active and its last 20 log lines, read over ssh with `journalctl -u strats@<id> -n 20 --no-pager`.
 
-**close**, single asset: cancels our target, closes the position with a reduce-only order, and then cancels our stop, after a y/N confirm. It cancels orders by id and never uses cancel-all. `--coin` names the coin yourself when the gateway cannot be reached. **close**, theme: sells every position in a configured market at the bid, after a y/N confirm, and leaves positions in other markets alone. A running bot will open again if the targets still say so, so stop it first if you want to stay out.
+**close**, single asset: cancels our target, closes the position with a reduce-only order, and then cancels our stop, after a y/N confirm. It cancels orders by id and never uses cancel-all. `--coin` names the coin yourself when the gateway cannot be reached. **close**, theme: sells every position in a configured market at the bid, after a y/N confirm, and leaves positions in other markets alone. **close**, team: the same, for positions in the team's games. It reads the games from the targets first; when they cannot be read it sells nothing and lists what Polymarket shows for the wallet. A running bot will open again if the targets still say so, so stop it first if you want to stay out.
+
+**buyback** is described under "Buyback".
 
 **config** compares the server's settings with the pinned payout settings. `accept` shows the exact change and re-pins after a y/N confirm. `publish-wallet` shows or changes whether reports carry the wallet address; see "Publishing the wallet address".
 
-For unattended runs on your own machine set `STRATS_PASSPHRASE`. Data lives in `~/.strats` (`STRATS_HOME` overrides): `keys/`, `bots/<id>.json`, `state/<id>.json`, `logs/<id>.log`, `ssh/`.
+For unattended runs on your own machine set `STRATS_PASSPHRASE`. Data lives in `~/.strats` (`STRATS_HOME` overrides): `keys/`, `bots/<id>.json`, `state/<id>.json`, `state/<id>.payouts.jsonl`, `logs/<id>.log`, `ssh/`.
+
+Exit codes: 0 done, 1 failed, 2 wrong usage, 3 a buyback stopped part-way with the money safe (run it again), 130 stopped with Ctrl-C.
 
 ## Deploy
 
@@ -187,7 +199,7 @@ What it does, in order:
 6. Sends the credentials over ssh standard input into `/etc/strats/<id>.env`, mode 0600, owned by the `strats` user. They never appear in a command line, in the first-boot data, or in DigitalOcean's API.
 7. Starts the systemd unit `strats@<id>`, which runs `strats run --id <id>` with `Restart=always`, and waits until it is active.
 
-A second `strats deploy` reuses the droplet when the region and size are unchanged: it updates the runner, replaces the credentials and restarts the service. Otherwise it replaces the droplet. A theme bot is refused a US region, because Polymarket refuses orders from there.
+A second `strats deploy` reuses the droplet when the region and size are unchanged: it updates the runner, replaces the credentials and restarts the service. Otherwise it replaces the droplet. A theme or team bot is refused a US region, because Polymarket refuses orders from there.
 
 ### What reaches the droplet
 
@@ -196,9 +208,11 @@ One value, `STRATS_RUNTIME_CREDS`, in that 0600 file. It holds:
 - the API key and the gateway URL;
 - the bot file: addresses, your ceiling, the pinned payout settings, and your choice about publishing the wallet address, none of it secret;
 - for a single-asset bot, the Hyperliquid trading key and the wallet's public address. The trading key can place orders and cannot withdraw;
-- for a theme bot, the Polymarket wallet key, the deposit wallet's address and the Polymarket API credentials. There is no trading-only key on Polymarket, so whoever controls the droplet controls the funds in that wallet. `deploy` says so before it asks.
+- for a theme or team bot, the Polymarket wallet key, the deposit wallet's address and the Polymarket API credentials. There is no trading-only key on Polymarket, so whoever controls the droplet controls the funds in that wallet. `deploy` says so before it asks.
 
-The keystore file and its passphrase never leave your machine, and neither does a Hyperliquid master key. The droplet has no keystore: `run` reads `STRATS_RUNTIME_CREDS` when it is set and uses it instead, then removes it from its own environment.
+After a buyback the droplet also receives `state/<id>.payouts.json`: the dollars bought back and the date and amount of each withdrawal, so its report shows the right totals. It holds no secret and gives the droplet nothing to act on.
+
+The keystore file and its passphrase never leave your machine, and neither does a Hyperliquid master key. `strats buyback` refuses to run on a droplet. The droplet has no keystore: `run` reads `STRATS_RUNTIME_CREDS` when it is set and uses it instead, then removes it from its own environment.
 
 ## What the runner does with a target
 
@@ -259,23 +273,124 @@ The Hyperliquid adapter this program uses only opens positions when the account 
 
 ## What this release does not do
 
-- **Buyback.** The profit split is pinned and shown by `status`, but nothing is bought or paid out. No funds leave the wallet, and the report's `boughtBackUsd` is always 0.
-- Withdrawals. Funds stay on the venue until you withdraw them with the wallet key using other tooling.
+- Buybacks by themselves. Nothing is paid out until you run `strats buyback --execute` on your own machine and answer y.
+- Other withdrawals. The kept share of the profit, and your deposits, stay on the venue until you withdraw them with the wallet key using other tooling.
 - Single asset: more than one position. One asset, one position, no pyramiding.
 - Theme: stops. A theme position is sold at its take-profit price or when its market closes, and otherwise held to resolution. It can go to zero.
 - Theme: adding to a position, or entering the same market a second time.
+- Team: selling before the game ends. See "Back a team".
 - Hosting on anything other than a DigitalOcean droplet in your own account.
 
 ## Risk
 
-This software trades real money with no human in the loop. You can lose some or all of the funds in the wallet. Q's targets can be wrong. A prediction-market share pays nothing when its outcome does not happen. Stops are market orders triggered on the venue and can fill far from the stop price in a fast market or a gap, and perpetual positions pay or receive funding. Hyperliquid, the Arbitrum bridge, the gateway or your own machine can fail or be unreachable; while the runner is down, only the stop and target orders already resting on the venue protect a position. Anyone who has both the keystore file and its passphrase controls the wallet, and there is no recovery if you lose either. Anyone who gains control of a deployed droplet can trade a single-asset bot's account and can take a theme bot's funds. The software is provided as is, without warranty, under the Apache-2.0 license. Start with `--dry-run`, then with an amount you can afford to lose.
+This software trades real money with no human in the loop. You can lose some or all of the funds in the wallet. Q's targets can be wrong. A prediction-market share pays nothing when its outcome does not happen. Stops are market orders triggered on the venue and can fill far from the stop price in a fast market or a gap, and perpetual positions pay or receive funding. Hyperliquid, the Arbitrum bridge, the gateway or your own machine can fail or be unreachable; while the runner is down, only the stop and target orders already resting on the venue protect a position. Anyone who has both the keystore file and its passphrase controls the wallet, and there is no recovery if you lose either. Anyone who gains control of a deployed droplet can trade a single-asset bot's account and can take a theme or team bot's funds. A buyback swaps through LI.FI and the bridges and exchanges it routes to; a thin token can fill badly inside the slippage you allow, and a bridge can fail or hold funds. The software is provided as is, without warranty, under the Apache-2.0 license. Start with `--dry-run`, then with an amount you can afford to lose.
 
 ## Development
 
 ```
 npm install
-npm test        # unit tests: both decision functions, protocol, client, venues, deploy, runtime credentials, report, trade list, init stages
+npm test        # unit tests: both decision functions, protocol, client, venues, deploy, runtime credentials, report, trade list, init stages, team markets, buyback
 npm run build
 ```
 
-`src/reconcile.ts` and `src/reconcile-theme.ts` are the decision functions: pure, no I/O, fully tested. `src/venue.ts` and `src/venue-polymarket.ts` are the only files that place orders. `src/commands/fund.ts` is the only file that causes a Hyperliquid master key to be read. `src/runtime-creds.ts` defines, with a strict schema, everything a droplet can receive. `src/install.ts` is the pure function that decides which step of `init` comes next. `src/report.ts` builds the report, and `src/protocol/index.ts` holds the schema every report is checked against before it is sent. `src/deploy/` is adapted from the deploy code in cassie (Apache-2.0, same organisation); each file names its source.
+`src/reconcile.ts` and `src/reconcile-theme.ts` are the decision functions: pure, no I/O, fully tested. A team bot uses `reconcileTheme` unchanged; `src/team-markets.ts` is the pure check that decides which games it may trade. `src/venue.ts` and `src/venue-polymarket.ts` are the only files that place orders. `src/commands/fund.ts` and `src/buyback/` are the only code that causes a Hyperliquid master key to be read. In `src/buyback/`, `plan.ts` is the money arithmetic, `lifi.ts` the quote checks, `machine.ts` the recorded sequence and every way of resuming it, all tested with fakes; `venues.ts` and `chain.ts` are the only files that withdraw, approve or swap. `src/runtime-creds.ts` defines, with a strict schema, everything a droplet can receive. `src/install.ts` is the pure function that decides which step of `init` comes next. `src/report.ts` builds the report, and `src/protocol/index.ts` holds the schema every report is checked against before it is sent. `src/deploy/` is adapted from the deploy code in cassie (Apache-2.0, same organisation); each file names its source.
+
+## Back a team
+
+A team key trades one team's games on Polymarket. Sports are not forecast by Q. The bet follows a market rule you chose on TokenStrats, and `init` shows it:
+
+| Bet | What is bought |
+|---|---|
+| Always back them | The team to win |
+| Always bet against them | The other side of the same market |
+| Follow the market | The favorite, when it leads by at least your margin |
+| Back them only when favored | The team, when it leads by at least your margin |
+| Bet against them only when the market does | The other side, when it leads by at least your margin |
+
+The lead is the price of the team's side less the price of the other side, in cents. Nothing is bought above your price limit.
+
+In soccer each game has three Yes/No markets. The bot trades the one that asks whether your team wins. Betting against the team buys "No", which pays when the team loses or draws.
+
+| Situation | Action |
+|---|---|
+| A game starts within 24 hours, more than 5 minutes remain, and the rule says bet | Buy once, with a fill-and-kill order at the ask, up to your price limit |
+| The game has started | Hold. Nothing is bought and nothing is sold |
+| The game has finished and its market has closed | Redeem the position if it has resolved, otherwise sell it at the bid |
+| Gateway unreachable, any non-200 answer, an answer that does not match the protocol, or now past `validUntil` | **Hold** |
+| Mode is `reduce-only` | Open nothing. Keep redeeming and selling finished games |
+
+The server names the games. The runner checks each one against your settings before it trades: the market must name your team exactly, the side bought must be one your bet allows, the price limit must not be above yours, and the entry must close before the game starts. A game that fails is refused and the cycle line says why. Sizing, the ceiling, one entry per market and the 15-minute wait after an unknown result are the same as for a theme bot.
+
+Games are matched by the team's name on Polymarket. If Polymarket renames the team, the bot finds no games and places no bets until you save the strategy again on TokenStrats. `strats status` shows a "Games" row with the number of upcoming, live and finished games; zero across the board during the season is the sign.
+
+Finished games are read back 14 days. A position whose game closed during a longer outage is not redeemed by the runner. Use `strats close` or polymarket.com.
+
+Not yet exercised with a real order: soccer markets are "negative risk" markets on Polymarket. The adapter sets the approvals for them, but this runner has not placed or redeemed a real order on one. Start a soccer bot with a small amount and check the first game by hand.
+
+## Buyback
+
+```
+strats buyback                  # dry run: the plan and a live quote; nothing is signed or sent
+strats buyback --execute        # the same plan, then a y/N question, then it is carried out
+```
+
+`buyback` measures the bot's profit, splits it by the percentages pinned on this machine, withdraws the buyback share to the bot's own wallet, and swaps it for the pinned token through LI.FI. The kept share stays in the venue. The token goes to the bot's own wallet unless you pinned another address with `--to`.
+
+It runs on your machine only and refuses to start on a droplet. A single-asset bot's droplet holds a trading key that cannot withdraw. A theme or team bot's droplet holds the wallet key, as "What reaches the droplet" says, but not Polymarket's relayer credentials or the payout record, and it does not run this command. The token, its chain, the split and the destination are read from the bot file. Nothing Quotient serves can change them, and the withdrawal always goes to the bot's own wallet address. The one read from Quotient is a single-asset bot's target, to learn which Hyperliquid dex the money is in; `--dex` replaces it.
+
+### The arithmetic
+
+```
+profit        = wallet value now - deposits less withdrawals
+to split now  = profit - profit already split by earlier buybacks   (not below 0)
+buyback share = to split now x pinned buyback percent
+withdrawn     = the smaller of the buyback share and the free collateral, cut to whole cents
+```
+
+A withdrawal lowers the wallet value and the deposits figure by the same amount, so profit does not move, and the whole split is recorded as settled when the money leaves. A second run straight after the first finds nothing to split.
+
+For Hyperliquid, deposits and withdrawals come from the venue's own history. Polymarket has none, so the deposits figure is the one `strats fund` recorded on this machine, less each buyback withdrawal made since. Money added to the Polymarket wallet without `strats fund` reads as profit and would be paid out. The plan prints "Deposits less withdrawals" first for that reason. On a machine with no record, set it: `strats buyback --set-deposits 1000`. For a Polymarket bot, the wallet value counts free collateral and the positions Polymarket lists; a position it does not list is left out, which lowers the payout.
+
+A share under `--min-usd` (default 25, at least 10) is not paid. When part of the share is tied up in positions, the buyback uses the free part and the rest waits.
+
+### The route
+
+| Bot | Withdrawal | Swap starts from |
+|---|---|---|
+| Single asset | USDC from Hyperliquid to the wallet on Arbitrum. Hyperliquid keeps $1. For a HIP-3 dex the money moves to the main account first | USDC on Arbitrum |
+| Theme, team | pUSD from the Polymarket deposit wallet to the signing wallet on Polygon. No fee | pUSD on Polygon |
+
+The wallet needs a little ETH on Arbitrum, or POL on Polygon, for the approval and the swap. `--execute` checks this before it asks, so money does not leave the venue for a wallet that cannot move it. Tokens on Ethereum, Base and Arbitrum can be bought.
+
+### Quote checks
+
+A quote is used only if all of these hold; otherwise nothing is sent and the failed check is named: the source chain, token, amount and sender are ours; the destination chain, token and receiver are the pinned ones; the contract to approve and the contract to call are the LI.FI Diamond address pinned in this program (taken from LI.FI's published deployments); the transaction sends no ETH or POL; the promised minimum is above zero; the price impact by LI.FI's figures is within `--max-impact` (default 3%); the slippage is the one asked for (`--slippage`, default 1%).
+
+The approval is for exactly the amount swapped, never more. After the withdrawal arrives the price is quoted again, and the swap is refused if it promises less than 98% of the minimum you agreed to. The USDC or pUSD then stays in the wallet.
+
+The swap's calldata cannot be read by this program. The checks cover the addresses, chains, amounts and the pinned contract, and the exact allowance limits a bad route to one payout.
+
+### Stopping and continuing
+
+Each step is written to `state/<id>.buyback.json` before it is taken. Run `strats buyback --execute` again after any stop. It prints "Continuing the buyback started ..." and picks up from the record:
+
+| Stopped | Where the money is | The next run |
+|---|---|---|
+| Before the withdrawal | In the venue | Plans again |
+| Withdrawal sent, result unknown | In the venue or on its way | Does not send it again. Looks for it in Hyperliquid's history or in the wallet for up to 30 minutes |
+| Withdrawal sent | On its way to the wallet | Waits for it |
+| In the wallet | USDC or pUSD in your wallet | Shows a new quote and asks y/N again |
+| Approval or swap sent, not confirmed | In the wallet, or swapped | Looks the transaction up. A transaction the chain never saw is sent again only with the same nonce. If another transaction used that nonce it stops and names the explorer page |
+| Swap confirmed | With LI.FI's route | Asks LI.FI until it is done |
+
+One buyback is in flight at most, and a new one is refused while the record exists. The withdrawal is written to `state/<id>.payouts.jsonl` when the money leaves, whether or not a swap follows, so that profit is not paid twice. That file is only appended to. If a line in it cannot be read, a dry run warns and `--execute` refuses until you repair it.
+
+If a run stops with "Another transaction used this wallet", check the explorer page it names. When the swap is not there, the money is still in the wallet; remove `state/<id>.buyback.json` yourself and move the money as you see fit. The withdrawal stays counted.
+
+### Other forms
+
+`--to <address>` pins where the bought token goes, after showing the old and new address and asking y/N. `--to wallet` returns to the bot's own wallet. `--sync` sends the droplet the buyback totals for its public report; a failed send after a buyback is reported and does not change the result.
+
+### Not yet exercised with real money
+
+No withdrawal, approval or swap has been run for real from this code. The tests use stand-ins for the venue, the wallet and LI.FI, and the dry run reads live data and a live quote. Two points to watch on the first real run: whether Hyperliquid's history records the amount asked for or the amount after its $1 fee (the code accepts either), and the move from a HIP-3 dex to the main account before a withdrawal. Polymarket buybacks depend on LI.FI routing pUSD; when it offers no route the command says so and tries nothing else.
