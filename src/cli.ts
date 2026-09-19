@@ -18,6 +18,8 @@ Usage
       The whole install. Read the settings, create the wallet and keystore, pin the payout settings,
       show the address to fund and wait for the deposit, then deploy the runner to a droplet (blr1, Bangalore).
       A theme or team key also sets up the Polymarket account. Asks once whether to publish the wallet address; the default is no.
+      Asks once, on a terminal only: "Buy back automatically? This puts your wallet key on your droplet, so the droplet can withdraw."
+      The default is no. See strats config auto-buyback.
       A single-asset key with Polymarket markets is still one bot: init sets up Hyperliquid and the Polymarket account, funds the
       perp, then funds Polymarket. That last step can be skipped, at its question or with --perp-only, to start with the perp only.
       Stop at any point with Ctrl-C and run strats init again: it continues where it stopped and keeps the wallet.
@@ -38,6 +40,8 @@ Usage
   strats deploy [--id name] [--region blr1] [--size s-1vcpu-1gb] [--from-tarball] [--dry-run] [-y]
       The deploy step of init, on its own, and the way to update a droplet.
       Put the runner on a DigitalOcean droplet in your own account, as a service that restarts.
+      The plan says what is sent to the droplet. The wallet's master key is sent only when auto-buyback is on.
+      Before a droplet that bought back by itself is replaced or loses that setting, its payout record comes back to this machine.
       Shows the plan and the monthly cost and asks before creating anything. -y skips the question.
       --dry-run prints the plan and the first-boot script without calling DigitalOcean.
       --from-tarball copies this build to the droplet instead of installing from npm.
@@ -45,6 +49,7 @@ Usage
       The deployed runner's log over ssh, or the local log file when not deployed.
   strats destroy [--id name] [-y]
       Stop the runner and delete the droplet and its firewall. Positions are not touched.
+      A droplet that bought back by itself hands its payout record to this machine first; --force goes on when it cannot be read.
   strats status [--id name]
       Wallet, equity, positions, the current targets, settings, and the deployed runner's last lines.
   strats close [--id name] [--coin COIN] [--venue polymarket]
@@ -54,7 +59,8 @@ Usage
       for your token through LI.FI. Without --execute it is a dry run: it reads everything, fetches a live quote, prints
       the whole plan, and signs and sends nothing. --execute shows the same plan and always asks y/N; -y does not skip it.
       A run that stops part-way is continued by running it again. It never pays the same profit twice.
-      Runs on this machine only, never on the droplet. Tokens on Ethereum, Base and Arbitrum.
+      Runs on this machine only. Tokens on Ethereum, Base and Arbitrum.
+      While auto-buyback is on and the bot is deployed, the droplet does the buybacks and --execute is refused here. The dry run still works.
       --min-usd (at least 10) is the smallest withdrawal worth the fees. --slippage (at most 5) and --max-impact
       (at most 10) are percents. --dex names the Hyperliquid dex to take the money from; main is the main dex.
   strats buyback --to <0x address | wallet> [--id name]
@@ -63,10 +69,17 @@ Usage
       Polymarket bots: record everything ever deposited, on a machine that has no record. Profit is measured from it.
   strats buyback --sync [--id name]
       Send the droplet the buyback totals its public report shows. Nothing else is sent.
+      A droplet that buys back by itself is sent this machine's deposits figure and payout record instead.
   strats config [show|accept] [--id name]
       Compare the server's settings with the pinned payout settings. accept re-pins them.
   strats config publish-wallet [on|off] [--id name]
       Show or change whether reports carry the wallet address, which lets the public project page show it. Off by default.
+  strats config auto-buyback [on|off] [--id name]
+      Show or change whether the droplet buys back by itself. Off by default. On asks y/N on a terminal first, because for a
+      Hyperliquid bot it puts the wallet key on the droplet, so the droplet can withdraw. A theme or team bot's droplet already holds it.
+      When on, the droplet checks the profit 10 minutes after it starts and then once a day, and runs the same buyback as
+      strats buyback --execute whenever the buyback share is at least $25: same split, caps, quote checks and record.
+      A deployed droplet keeps the old setting until the next strats deploy.
 
 Environment
   STRATS_PASSPHRASE     keystore passphrase, for unattended runs

@@ -1,9 +1,10 @@
 // Everything strats buyback says about a plan, as pure functions of the plan
 // and the quote, so the exact words are tested. Amounts of money use usd().
 import { usd } from "../reconcile.js";
+import { sendsMasterKey, type BotState } from "../state.js";
 import { LIFI_DIAMOND, priceImpactPct, type Quote } from "./lifi.js";
 import { tokenAmount } from "./machine.js";
-import type { Plan } from "./plan.js";
+import { MIN_USD_DEFAULT, type Plan } from "./plan.js";
 
 const CHAIN_LABELS: Readonly<Record<number, string>> = { 1: "Ethereum", 10: "Optimism", 137: "Polygon", 8453: "Base", 42161: "Arbitrum" };
 export const chainLabel = (chainId: number): string => CHAIN_LABELS[chainId] ?? `chain ${chainId}`;
@@ -156,3 +157,21 @@ export function renderConfirmation(plan: Pick<Plan, "withdrawUsd" | "feeUsd" | "
 
 export const CONFIRM_QUESTION = "Go ahead? (y/N)";
 export const DRY_RUN_FOOTER = "Nothing was sent. To carry it out: strats buyback --execute";
+
+/**
+ * The one question behind auto-buyback, asked by strats init and restated by strats config auto-buyback on. A Hyperliquid bot gives up
+ * "the droplet cannot withdraw". A theme or team bot's droplet already holds its wallet key, so the question says that instead.
+ */
+export function autoBuybackQuestion(bot: Pick<BotState, "strategyId">): string {
+  return sendsMasterKey({ ...bot, autoBuyback: true })
+    ? "Buy back automatically? This puts your wallet key on your droplet, so the droplet can withdraw."
+    : "Buy back automatically? Your droplet already holds this bot's wallet key, so nothing more is sent to it.";
+}
+
+export function describeAutoBuyback(bot: Pick<BotState, "autoBuyback" | "deployment">): string {
+  const setting = bot.autoBuyback === true
+    ? `on: once a day the droplet checks the profit and buys back by itself when the buyback share is at least $${MIN_USD_DEFAULT}`
+    : "off: nothing is paid out until you run strats buyback --execute";
+  if (!bot.deployment || (bot.deployment.autoBuyback === true) === (bot.autoBuyback === true)) return setting;
+  return `${setting}. The droplet still has it ${bot.deployment.autoBuyback === true ? "on" : "off"}, until the next: strats deploy`;
+}

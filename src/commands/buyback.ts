@@ -6,17 +6,19 @@
 // the destination come from the bot file, and the withdrawal always goes to the
 // bot's own wallet. The one read from Quotient is the target of a single-asset
 // bot, and only to learn which Hyperliquid dex the money comes FROM. This
-// command never runs on a droplet, and the droplet never receives the power to
-// do any of it.
+// command never runs on a droplet. A droplet buys back by itself only when the
+// creator turned auto-buyback on (src/buyback/auto.ts), and while it does,
+// --execute is refused here, so the same profit is never paid from two places.
 import { randomBytes } from "node:crypto";
 import { KeyRoles } from "@quotient-forecasting/cassie-core";
 import { isAddress } from "viem";
 import { UsageError, type Args } from "../args.js";
 import { SOURCE_CHAINS, chainWallet, checkGas, type GasCheck } from "../buyback/chain.js";
+import { pullRecord, pushBasis } from "../buyback/droplet.js";
 import { fileJournal, type Journal } from "../buyback/journal.js";
 import { checkQuote, fetchQuote, fetchStatus, floorFrom, type QuoteExpectation } from "../buyback/lifi.js";
 import { moneyText, resumePayout, startPayout, type BuybackDeps, type Outcome } from "../buyback/machine.js";
-import { MIN_USD_DEFAULT, MIN_USD_FLOOR, planBuyback, refusalText } from "../buyback/plan.js";
+import { MAX_IMPACT_DEFAULT, MIN_USD_DEFAULT, MIN_USD_FLOOR, SLIPPAGE_DEFAULT, planBuyback, refusalText } from "../buyback/plan.js";
 import { CONFIRM_QUESTION, DRY_RUN_FOOTER, SUPPORTED_TOKEN_CHAINS, chainLabel, renderConfirmation, renderHeader, renderProfit, renderQuote, renderRoute, renderSplit, type RouteContext } from "../buyback/text.js";
 import { BuybackRefusal, hyperliquidVenue, polymarketVenue, type BuybackVenuePort } from "../buyback/venues.js";
 import { fetchTarget } from "../client.js";
@@ -26,10 +28,7 @@ import { usd } from "../reconcile.js";
 import { loadRuntimeState, saveRuntimeState } from "../runtime-state.js";
 import { loadPolymarketCreds, openSession, requireKeystore, runtimeCredsPresent, scrub, sessionSecrets, type KeystoreSession } from "../session.js";
 import { readSecret, type Prompts } from "../setup.js";
-import { isPolymarketBot, loadBot, resolveBotId, saveBot, type BotState } from "../state.js";
-
-const SLIPPAGE_DEFAULT = 1;
-const MAX_IMPACT_DEFAULT = 3;
+import { dropletBuysBack, isPolymarketBot, loadBot, resolveBotId, saveBot, type BotState } from "../state.js";
 
 function percentFlag(raw: string | undefined, name: string, fallback: number, max: number): number {
   if (raw === undefined) return fallback;
@@ -51,8 +50,23 @@ async function askGoAhead(prompts: Prompts, question: string): Promise<boolean> 
   return answer === "y" || answer === "yes";
 }
 
+/** The one sentence strats buyback --execute says instead of paying, while a droplet may be paying out the same profit. Null when it may go ahead. */
+export function executeRefusal(bot: Pick<BotState, "autoBuyback" | "deployment">): string | null {
+  return dropletBuysBack(bot)
+    ? "The droplet does the buybacks for this bot, so nothing is paid from here; to do one by hand, turn auto-buyback off (strats config auto-buyback off) and run strats deploy."
+    : null;
+}
+
 /** strats buyback --sync: send the droplet the payout totals its report shows. Nothing else. */
 function sync(bot: BotState): number {
+  if (bot.deployment?.autoBuyback === true) {
+    // This droplet keeps its own totals. What it takes from here is what it measures profit from: the deposits figure and this machine's payout record.
+    const sent = pushBasis(bot);
+    console.log(sent.ok
+      ? `The droplet ${bot.deployment.host} now has this machine's deposits figure and payout record. Its automatic buyback measures profit from them.`
+      : `The droplet could not be reached (${sent.message}). To try again: strats buyback --sync`);
+    return sent.ok ? 0 : 1;
+  }
   writePayoutSummary(bot.id);
   const result = pushPayoutSummary(bot);
   if (result.pushed) console.log(`The droplet ${bot.deployment!.host} now has this bot's buyback totals. Its next report shows them.`);
@@ -101,6 +115,10 @@ async function setDeposits(session: KeystoreSession, prompts: Prompts, raw: stri
   // The beginning of time: every withdrawal in the payout record is subtracted from this figure.
   saveRuntimeState(bot.id, { ...state, netDepositsUsd: value, netDepositsAt: new Date(0).toISOString() });
   console.log(`Recorded. To see what a buyback would do now: strats buyback${bot.deployment ? "\nThe droplet keeps its own deposits figure for the public report. This changes only what strats buyback measures profit from." : ""}`);
+  if (bot.deployment?.autoBuyback === true) {
+    const sent = pushBasis(bot);
+    console.log(sent.ok ? "The droplet's automatic buyback measures profit from the new figure too." : `The droplet's automatic buyback still uses the old figure: it could not be reached (${sent.message}). To send it: strats buyback --sync`);
+  }
   return 0;
 }
 
@@ -138,6 +156,14 @@ export async function buyback(args: Args, prompts: Prompts): Promise<number> {
   const slippagePct = percentFlag(args.values.slippage, "slippage", SLIPPAGE_DEFAULT, 5);
   const maxImpactPct = percentFlag(args.values["max-impact"], "max-impact", MAX_IMPACT_DEFAULT, 10);
   if (execute && !prompts.interactive) throw new UsageError("strats buyback --execute asks a question and needs a terminal.");
+  if (execute) {
+    // Decided from the bot file alone, before the keystore is opened or anything is read.
+    const refusal = executeRefusal(loadBot(resolveBotId(args.values.id)));
+    if (refusal) {
+      console.log(refusal);
+      return 1;
+    }
+  }
 
   if (args.flags.has("sync")) return sync(loadBot(resolveBotId(args.values.id)));
   const session = requireKeystore(await openSession(args, prompts), "buyback");
@@ -150,6 +176,13 @@ export async function buyback(args: Args, prompts: Prompts): Promise<number> {
   const secrets: Array<string | undefined> = [...sessionSecrets(session)];
   const print = (text: string): void => console.log(scrub(text, secrets));
   prompts.interruptMessage = "Stopped. To continue, run: strats buyback --execute. It picks up from what was recorded and never sends a payment twice.";
+
+  if (bot.deployment?.autoBuyback === true) {
+    // A dry run beside a droplet that buys back by itself: its payout lines are copied here first, so "Already split" is true.
+    const pulled = pullRecord(bot, { moveJournal: false });
+    if (!pulled.ok) print(`The droplet's payout record could not be read (${pulled.message}), so "Already split" below may be out of date.`);
+    else if (pulled.journal === "left") print(`The droplet is part-way through a buyback (${pulled.stage}). It continues it at its next check.`);
+  }
 
   const store = fileJournal(bot.id);
   let journal = store.load();
@@ -310,7 +343,8 @@ export async function buyback(args: Args, prompts: Prompts): Promise<number> {
     return 1;
   }
   if (!execute) {
-    print(DRY_RUN_FOOTER);
+    print(bot.deployment?.autoBuyback === true ? "Nothing was sent. The droplet carries this out by itself at its next daily check."
+      : dropletBuysBack(bot) ? "Nothing was sent. Auto-buyback is on, and the droplet learns of it at the next: strats deploy" : DRY_RUN_FOOTER);
     return 0;
   }
   if (!gas) {

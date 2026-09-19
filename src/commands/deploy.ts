@@ -16,12 +16,14 @@ import {
 import { ensureDigitalOceanReady, publicIpv4, type Droplet } from "../deploy/digitalocean.js";
 import { remoteWriteCommand } from "../deploy/remote-write.js";
 import { ensureKeypair, forgetHostKey, pinHostKey, restrictedChildEnv, scpTo, sshExec, sshExecOrThrow, type Target } from "../deploy/ssh.js";
+import { pullRecord, pushBasis } from "../buyback/droplet.js";
+import { fileJournal } from "../buyback/journal.js";
 import { ensureHome } from "../paths.js";
 import { pushPayoutSummary } from "../payouts.js";
-import { RUNTIME_CREDS_ENV, buildRuntimeCreds, encodeRuntimeCreds } from "../runtime-creds.js";
-import { loadAgentKey, loadPolymarketCreds, openSession, requireKeystore, runtimeCredsPresent, type KeystoreSession } from "../session.js";
+import { RUNTIME_CREDS_ENV, buildRuntimeCreds, encodeRuntimeCreds, type RuntimeCredsDoc } from "../runtime-creds.js";
+import { loadAgentKey, loadPolymarketCreds, loadWalletKey, openSession, requireKeystore, runtimeCredsPresent, type KeystoreSession } from "../session.js";
 import type { Prompts } from "../setup.js";
-import { isPolymarketBot, isTwoVenueBot, loadBot, resolveBotId, saveBot, type BotState } from "../state.js";
+import { isPolymarketBot, isTwoVenueBot, loadBot, resolveBotId, saveBot, sendsMasterKey, type BotState } from "../state.js";
 import { packageRoot, packageVersion } from "../version.js";
 
 /** Polymarket refuses orders from the United States, so a bot that trades there is never placed there. */
@@ -64,8 +66,23 @@ export function monthlyCost(size: string): string {
   return price === undefined ? "see DigitalOcean's price list for this size" : `$${price} per month, billed by DigitalOcean to your account`;
 }
 
-/** What the droplet receives, in plain words. Shown before anything is created. */
+/** What the droplet receives, in plain words. Shown before anything is created. With auto-buyback off it is word for word what it was before 0.5.0. */
 export function disclosure(bot: BotState): string[] {
+  const lines = tradingDisclosure(bot);
+  if (bot.autoBuyback !== true) return lines;
+  if (!sendsMasterKey(bot)) {
+    // A theme or team bot: the wallet key is already among the lines above.
+    return [...lines, "Auto-buyback is on: once a day the droplet withdraws the buyback share of the profit and swaps it for your token, with the wallet key it already holds. Nothing more is sent for it."];
+  }
+  return [
+    lines[0]!.replace(/\.$/, "; the wallet's master key, because auto-buyback is on."),
+    "Auto-buyback is on, so the droplet holds the wallet's master key and can withdraw: whoever controls the droplet controls the funds in this Hyperliquid account and wallet. To keep that key on this machine: strats config auto-buyback off",
+    ...lines.slice(1, -1),
+    "The keystore file and its passphrase stay on this machine.",
+  ];
+}
+
+function tradingDisclosure(bot: BotState): string[] {
   const common = ["the API key", `this bot's settings file, which holds addresses, percentages and your choice about publishing the wallet (${bot.publishWallet === true ? "published" : "not published"}), and nothing secret`];
   if (isTwoVenueBot(bot)) {
     return [
@@ -150,6 +167,69 @@ function printPlan(bot: BotState, region: string, size: string, version: string,
   for (const line of disclosure(bot)) console.log(`  ${line}`);
 }
 
+/** A record that cannot be read counts as open: what was sent is not known. */
+function localBuybackOpen(botId: string): boolean {
+  try {
+    return fileJournal(botId).load() !== null;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Everything the droplet is sent, read from the keystore. The wallet's master key is read only when the bot file says
+ * autoBuyback and the money is on Hyperliquid. With auto-buyback off it is never read, so it cannot be sent.
+ */
+export function runtimeCredsFor(session: KeystoreSession, bot: BotState = session.bot): RuntimeCredsDoc {
+  let buybackMasterPk: string | undefined;
+  if (sendsMasterKey(bot)) {
+    buybackMasterPk = loadWalletKey(session) ?? undefined;
+    if (!buybackMasterPk) throw new Error("Auto-buyback is on, and the keystore has no wallet key to send.");
+  }
+  return buildRuntimeCreds({
+    apiKey: session.gateway.apiKey,
+    gatewayUrl: session.gateway.gatewayUrl,
+    bot,
+    ...(isPolymarketBot(bot) ? {} : { hyperliquid: { agentPk: loadAgentKey(session), masterAddress: bot.masterAddress } }),
+    ...(isPolymarketBot(bot) || isTwoVenueBot(bot) ? { polymarket: loadPolymarketCreds(session) } : {}),
+    ...(buybackMasterPk ? { buybackMasterPk } : {}),
+  });
+}
+
+/**
+ * Bring home what a droplet that bought back by itself recorded. When it keeps buying back on the same droplet, its lines are copied
+ * and nothing else changes. Otherwise its runner is stopped first, so nothing is written while it is read, and a buyback that is
+ * part-way moves to this machine, where strats buyback --execute finishes it. Returns 0 to go on, 1 when the deploy must not.
+ */
+function takeBackRecord(bot: BotState, opts: { keepsBuyingBack: boolean; sameDroplet: boolean; force: boolean }): number {
+  const target: Target = { host: bot.deployment!.host, user: "root" };
+  if (opts.keepsBuyingBack) {
+    const pulled = pullRecord(bot, { moveJournal: false });
+    if (!pulled.ok) console.log(`The droplet's payout record could not be copied to this machine (${pulled.message}). It stays on the droplet, which keeps using it.`);
+    return 0;
+  }
+  sshExec(target, `systemctl stop ${unitName(bot.id)}`, undefined, { timeoutMs: 45_000 });
+  const restart = (): void => void sshExec(target, `systemctl start ${unitName(bot.id)}`, undefined, { timeoutMs: 45_000 });
+  // A droplet that is being replaced cannot hand over a buyback that is part-way and then be deleted half-way through a deploy that may fail.
+  const pulled = pullRecord(bot, { moveJournal: opts.sameDroplet });
+  if (!pulled.ok) {
+    if (opts.force) {
+      console.log(`The droplet's payout record could not be read (${pulled.message}). Going on because of --force. What that droplet paid out is missing from this machine's record, so strats buyback may offer to split the same profit again: check its "Already split" line before you say yes.`);
+      return 0;
+    }
+    restart();
+    console.log(`The droplet's payout record could not be read (${pulled.message}). It is the only copy of what the droplet paid out, so nothing was replaced. Try again. If that droplet is gone for good, add --force.`);
+    return 1;
+  }
+  if (pulled.journal === "left") {
+    restart();
+    console.log("The droplet is part-way through a buyback, and this deploy would delete it. Let it finish, or turn auto-buyback off (strats config auto-buyback off), run strats deploy with the same region and size, and finish it here with strats buyback --execute.");
+    return 1;
+  }
+  console.log(`The droplet's payout record is on this machine now${pulled.added > 0 ? ` (${pulled.added} new line${pulled.added === 1 ? "" : "s"})` : ""}.${pulled.journal === "moved" ? " A buyback that was part-way moved here too. When this deploy is done, finish it with: strats buyback --execute" : ""}`);
+  return 0;
+}
+
 export async function deploy(args: Args, prompts: Prompts): Promise<number> {
   return deployBot(args, prompts);
 }
@@ -186,6 +266,10 @@ export async function deployBot(args: Args, prompts: Prompts, open?: KeystoreSes
     console.log(problem);
     return 1;
   }
+  if (bot.autoBuyback === true && localBuybackOpen(bot.id)) {
+    console.log("A buyback is part-way on this machine, and once the droplet buys back by itself it cannot be finished from here. Finish it first: strats config auto-buyback off, then strats buyback --execute, then turn auto-buyback on again.");
+    return 1;
+  }
   // Settle the DigitalOcean account before asking for the keystore passphrase.
   const { client } = await ensureDigitalOceanReady(prompts);
   const useTarball = args.flags.has("from-tarball") || !publishedOnNpm(version);
@@ -207,13 +291,11 @@ export async function deployBot(args: Args, prompts: Prompts, open?: KeystoreSes
 
   const session = open ?? requireKeystore(await openSession(args, prompts), "deploy");
   prompts.close();
-  const creds = encodeRuntimeCreds(buildRuntimeCreds({
-    apiKey: session.gateway.apiKey,
-    gatewayUrl: session.gateway.gatewayUrl,
-    bot,
-    ...(isPolymarketBot(bot) ? {} : { hyperliquid: { agentPk: loadAgentKey(session), masterAddress: bot.masterAddress } }),
-    ...(isPolymarketBot(bot) || isTwoVenueBot(bot) ? { polymarket: loadPolymarketCreds(session) } : {}),
-  }));
+  const creds = encodeRuntimeCreds(runtimeCredsFor(session, bot));
+  // A droplet that bought back by itself holds the only copy of what it paid out. It comes back to this machine before anything there is replaced.
+  const auto = bot.autoBuyback === true;
+  const wasAuto = bot.deployment?.autoBuyback === true;
+  if (wasAuto && takeBackRecord(bot, { keepsBuyingBack: reuse && auto, sameDroplet: reuse, force: args.flags.has("force") }) !== 0) return 1;
 
   const { publicKey } = ensureKeypair();
   const sshKeyId = await client.upsertSshKey("strats", publicKey);
@@ -243,7 +325,8 @@ export async function deployBot(args: Args, prompts: Prompts, open?: KeystoreSes
   if (!host) throw new Error("The droplet came up without a public IPv4 address.");
   // Record it at once, so a later failure still leaves `strats destroy` able to find the droplet.
   // `pending` stays until the runner is confirmed active, so a deploy stopped halfway is finished by strats deploy or strats init, not taken for done.
-  let saved: BotState = { ...bot, deployment: { dropletId: droplet.id, host, region: droplet.region.slug, size: droplet.size_slug, version, deployedAt: new Date().toISOString(), pending: true } };
+  // Until the new credentials are in place the droplet may still hold the old ones, so it counts as buying back if it did before.
+  let saved: BotState = { ...bot, deployment: { dropletId: droplet.id, host, region: droplet.region.slug, size: droplet.size_slug, version, deployedAt: new Date().toISOString(), pending: true, ...(auto || wasAuto ? { autoBuyback: true } : {}) } };
   saveBot(saved);
 
   await client.upsertFirewall(name, droplet.id).catch((error: unknown) => {
@@ -284,18 +367,28 @@ export async function deployBot(args: Args, prompts: Prompts, open?: KeystoreSes
   }
 
   writeRemote(target, UNIT_PATH, renderUnit(version), "0644", "root:root");
+  if (auto) {
+    // Before the key: the payout record and the deposits figure the droplet measures profit from. No secret. Without it the droplet pays nothing.
+    const sent = pushBasis(saved);
+    if (!sent.ok) throw new Error(`The droplet was not sent the payout record its automatic buyback measures profit from (${sent.message}). The credentials were not replaced. Run strats deploy again.`);
+  }
   // The only place the credentials travel: ssh stdin, into a file only the service user can read.
   writeRemote(target, envPath(bot.id), `${RUNTIME_CREDS_ENV}=${creds}\n`, "0600", "strats:strats");
   console.log("Credentials installed.");
   sshExecOrThrow(target, `systemctl daemon-reload && systemctl enable ${unitName(bot.id)} && systemctl restart ${unitName(bot.id)}`);
   await waitFor("Starting the runner", 3_000, 30, () => (sshExec(target, `systemctl is-active --quiet ${unitName(bot.id)}`, undefined, { timeoutMs: 20_000 }).ok ? true : null));
 
-  const { pending: _pending, ...confirmed } = saved.deployment!;
-  saved = { ...saved, deployment: { ...confirmed, deployedAt: new Date().toISOString() } };
+  // From here the droplet holds exactly what this deploy sent, so the record says what it was sent.
+  const { pending: _pending, autoBuyback: _before, ...confirmed } = saved.deployment!;
+  saved = { ...saved, deployment: { ...confirmed, deployedAt: new Date().toISOString(), ...(auto ? { autoBuyback: true } : {}) } };
   saveBot(saved);
-  // The buyback totals for the public report: two numbers and a list of dates, no secret. Best effort, and it never fails the deploy.
-  const payouts = pushPayoutSummary(saved);
-  if (!payouts.pushed && payouts.reason === "failed") console.log("The droplet was not told about earlier buybacks, so the public totals will lag. To send them: strats buyback --sync");
+  if (auto) {
+    console.log("Auto-buyback is on. The droplet checks the profit 10 minutes after it starts and then once a day, and keeps the payout record. strats buyback --execute is refused on this machine meanwhile.");
+  } else {
+    // The buyback totals for the public report: two numbers and a list of dates, no secret. Best effort, and it never fails the deploy.
+    const payouts = pushPayoutSummary(saved);
+    if (!payouts.pushed && payouts.reason === "failed") console.log("The droplet was not told about earlier buybacks, so the public totals will lag. To send them: strats buyback --sync");
+  }
   console.log("");
   console.log(`The runner is active on ${host} (${regionLabel(droplet.region.slug)}, ${droplet.size_slug}).`);
   console.log(`Cost: $${droplet.size?.price_monthly ?? SIZE_MONTHLY_USD[size] ?? "?"} per month, billed by DigitalOcean until you run strats destroy.`);

@@ -3,6 +3,7 @@
 // that one thing, and prints one line. Nothing is carried between cycles that
 // the venue could not tell us again after a restart.
 import { UsageError, type Args } from "../args.js";
+import { startAutoBuyback } from "../buyback/auto.js";
 import { fetchConfig, fetchTarget } from "../client.js";
 import { runLoop, runLoops, type VenueLoop } from "../loop.js";
 import { appendLog } from "../paths.js";
@@ -105,6 +106,8 @@ export async function run(args: Args, prompts: Prompts): Promise<number> {
   const markets = isTwoVenueBot(bot) ? await (await import("./run-theme.js")).assetMarketsLoop(session, { dryRun, emit, reporter, secrets }) : undefined;
 
   if (!once) emit(`Started bot "${bot.id}" for wallet ${bot.masterAddress}${markets ? ` and Polymarket wallet ${bot.polymarket!.funder}` : ""}. ${dryRun ? "Nothing will be signed or sent." : "Orders are live."} Ceiling ${bot.ceilingPct}%.`);
+  // Beside the loops, never inside a cycle: on a droplet whose creator opted in, the bot's profit is checked once a day.
+  startAutoBuyback(session, { dryRun, once, emit });
   const perpOptions = {
     once, intervalSec, emit, cycle: perp.cycle,
     stoppedMessage: "Stopped. Positions and their stop and target orders were left as they are on Hyperliquid.",

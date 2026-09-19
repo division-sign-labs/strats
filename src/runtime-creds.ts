@@ -1,9 +1,12 @@
 // The one value a deployed runner receives instead of a keystore. `strats
 // deploy` builds it on this machine and sends it over ssh stdin; `strats run`
 // reads it from STRATS_RUNTIME_CREDS when present. It never contains the
-// keystore, the passphrase, or a Hyperliquid master key.
+// keystore or the passphrase. It contains a Hyperliquid master key in one case
+// only: the creator turned auto-buyback on, which is the choice to let the
+// droplet withdraw. With auto-buyback off it is exactly what it was before 0.5.0.
+import { addressFromPk } from "@quotient-forecasting/cassie-core";
 import { z } from "zod";
-import { BotStateSchema, isPolymarketBot, isTwoVenueBot, type BotState } from "./state.js";
+import { BotStateSchema, isPolymarketBot, isTwoVenueBot, sendsMasterKey, type BotState } from "./state.js";
 
 export const RUNTIME_CREDS_ENV = "STRATS_RUNTIME_CREDS";
 
@@ -27,6 +30,11 @@ export const RuntimeCredsSchema = z.strictObject({
   botState: BotStateSchema,
   hyperliquid: z.strictObject({ agentPk: privateKey, masterAddress: address }).optional(),
   polymarket: PolymarketCredsSchema.optional(),
+  /**
+   * Present only when the bot file says autoBuyback, and only for a bot whose money is on Hyperliquid: the wallet's master key,
+   * which a buyback withdraws and swaps with. A theme or team bot's wallet key is already in its Polymarket arm, so it gets no arm here.
+   */
+  buyback: z.strictObject({ masterPk: privateKey }).optional(),
 });
 export type RuntimeCredsDoc = z.infer<typeof RuntimeCredsSchema>;
 
@@ -36,6 +44,8 @@ export interface RuntimeCredsInput {
   bot: BotState;
   hyperliquid?: { agentPk: string; masterAddress: string };
   polymarket?: PolymarketCreds;
+  /** The wallet's master key. Used only when the bot file says autoBuyback; otherwise it is dropped here, whatever the caller passed. */
+  buybackMasterPk?: string;
 }
 
 /**
@@ -50,12 +60,18 @@ export function buildRuntimeCreds(input: RuntimeCredsInput): RuntimeCredsDoc {
   }
   // A two-venue bot carries both arms. Its Polymarket arm is optional here: without it the droplet runs the perp only.
   const polymarket = isPolymarketBot(input.bot) || isTwoVenueBot(input.bot) ? input.polymarket : undefined;
+  const withMaster = sendsMasterKey(input.bot);
+  if (withMaster) {
+    if (!input.buybackMasterPk) throw new Error("Auto-buyback is on, and the wallet key it needs was not read from the keystore.");
+    if (addressFromPk(input.buybackMasterPk).toLowerCase() !== input.bot.masterAddress.toLowerCase()) throw new Error("The wallet key in the keystore does not match this bot's wallet address.");
+  }
   return RuntimeCredsSchema.parse({
     apiKey: input.apiKey,
     gatewayUrl: input.gatewayUrl,
     botState,
     ...(isPolymarketBot(input.bot) ? {} : { hyperliquid: { agentPk: input.hyperliquid!.agentPk, masterAddress: input.hyperliquid!.masterAddress } }),
     ...(polymarket ? { polymarket } : {}),
+    ...(withMaster ? { buyback: { masterPk: input.buybackMasterPk! } } : {}),
   });
 }
 

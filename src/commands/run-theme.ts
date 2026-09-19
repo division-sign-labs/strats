@@ -5,6 +5,7 @@
 // the settings and targets come from and which markets the bot may trade;
 // everything else is the same loop.
 import type { Args } from "../args.js";
+import { startAutoBuyback } from "../buyback/auto.js";
 import { runLoop, type VenueLoop } from "../loop.js";
 import { appendLog } from "../paths.js";
 import { sourceFor, type PolymarketConfigDoc, type PolymarketSource } from "../polymarket-source.js";
@@ -51,6 +52,8 @@ export async function runTheme(_args: Args, session: Session, opts: ThemeRunOpti
   const loop = marketsLoop(session, { source, venue, dryRun, emit, reporter });
 
   if (!opts.once) emit(`Started ${tag} bot "${bot.id}" for Polymarket wallet ${bot.polymarket.funder}. ${dryRun ? "Nothing will be signed or sent." : "Orders are live."} Ceiling ${bot.ceilingPct}%.`);
+  // Beside the loop, never inside a cycle: on a droplet whose creator opted in, the bot's profit is checked once a day.
+  startAutoBuyback(session, { dryRun, once: opts.once, emit });
   return runLoop({
     once: opts.once, intervalSec: opts.intervalSec, emit, cycle: loop.cycle,
     stoppedMessage: "Stopped. Positions were left as they are on Polymarket.",

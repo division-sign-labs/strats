@@ -1,4 +1,5 @@
 // strats status for a theme or team bot, and for the Polymarket side of a single-asset bot. Read-only: the venue it builds refuses every order.
+import { describeAutoBuyback } from "../buyback/text.js";
 import { ASSET_SOURCE, sourceFor } from "../polymarket-source.js";
 import { TEAM_BET_MODES, type ConfigDoc } from "../protocol/index.js";
 import { usd } from "../reconcile.js";
@@ -11,7 +12,7 @@ import { gameCounts } from "../team-markets.js";
 import { PolymarketVenue } from "../venue-polymarket.js";
 import { describePublication } from "./config.js";
 import { chainName } from "./init.js";
-import { row, showDeployment } from "./status.js";
+import { payoutNote, row, showDeployment } from "./status.js";
 
 export async function statusTheme(session: Session): Promise<number> {
   const { bot } = session;
@@ -25,6 +26,7 @@ export async function statusTheme(session: Session): Promise<number> {
   row("API key", `${bot.keyPrefix}...`);
   row("Ceiling", `${bot.ceilingPct}% of the wallet per position`);
   row("Project page", describePublication(bot));
+  row("Auto-buyback", describeAutoBuyback(bot));
 
   console.log("Settings");
   if (config.ok) {
@@ -95,7 +97,9 @@ export async function statusTheme(session: Session): Promise<number> {
   console.log("Profit split");
   const state = loadRuntimeState(bot.id);
   if (bot.deployment) {
-    console.log("  The deployed runner keeps its own totals on the droplet. The figures below are from this machine.");
+    console.log(bot.deployment.autoBuyback === true
+      ? "  The figures below use this machine's deposits figure, which is also what the droplet's automatic buyback measures profit from, and the droplet's payout record."
+      : "  The deployed runner keeps its own totals on the droplet. The figures below are from this machine.");
   }
   if (state.netDepositsUsd !== undefined) {
     const payouts = summary(bot.id);
@@ -108,7 +112,7 @@ export async function statusTheme(session: Session): Promise<number> {
   } else {
     row("Profit", "not shown: no deposit has been recorded yet");
   }
-  console.log("  Nothing is paid out by itself. strats buyback shows the plan; strats buyback --execute carries it out, from this machine only.");
+  console.log(payoutNote(bot));
 
   console.log("Next cycle");
   const decision = reconcileTheme({

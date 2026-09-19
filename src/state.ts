@@ -21,6 +21,11 @@ export const DeploymentSchema = z.object({
   deployedAt: z.string(),
   /** True from the moment the droplet exists until its runner is confirmed active. A deploy that was stopped in between is finished by running it again. */
   pending: z.boolean().optional(),
+  /**
+   * True when this droplet was given what it needs to buy back by itself, and so may be doing it. It follows the droplet, not the
+   * setting: turning auto-buyback off changes nothing there until the next strats deploy. Droplets deployed before 0.5.0 have no field.
+   */
+  autoBuyback: z.boolean().optional(),
 });
 export type Deployment = z.infer<typeof DeploymentSchema>;
 
@@ -52,6 +57,11 @@ export const BotStateSchema = z.object({
    * Then, and only then, a report carries the wallet address. Not a secret. Bots created before 0.3.0 have no field, which means false.
    */
   publishWallet: z.boolean().optional(),
+  /**
+   * True only when the creator chose, at a terminal, to let the droplet buy back by itself. Then, and only then, strats deploy sends
+   * the droplet what a buyback needs to withdraw and swap. Not a secret. Bots created before 0.5.0 have no field, which means false.
+   */
+  autoBuyback: z.boolean().optional(),
   ceilingPct: z.number().positive().max(MAX_POSITION_PCT),
   /**
    * Where a payout goes. `destination` is set only by strats buyback --to; without it the bought token goes to this bot's own wallet.
@@ -71,6 +81,12 @@ export const isTwoVenueBot = (bot: Pick<BotState, "strategyId" | "markets">): bo
 
 /** A two-venue bot keeps its Polymarket counters in a file of their own, because both loops run in one process. */
 export const marketsStateScope = (bot: Pick<BotState, "strategyId" | "markets">): "markets" | undefined => (isTwoVenueBot(bot) ? "markets" : undefined);
+
+/** True when strats deploy sends the wallet's master key: auto-buyback is on and the money is on Hyperliquid. A theme or team bot's droplet already holds its wallet key. */
+export const sendsMasterKey = (bot: Pick<BotState, "autoBuyback" | "strategyId">): boolean => bot.autoBuyback === true && !isPolymarketBot(bot);
+
+/** The droplet may be paying out: it was deployed with auto-buyback on, or the setting is on and a deploy is what sends it. */
+export const dropletBuysBack = (bot: Pick<BotState, "autoBuyback" | "deployment">): boolean => bot.deployment !== undefined && (bot.autoBuyback === true || bot.deployment.autoBuyback === true);
 
 export function botExists(id: string): boolean {
   return existsSync(botFile(id));

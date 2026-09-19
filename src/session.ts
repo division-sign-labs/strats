@@ -2,14 +2,14 @@
 // gateway, and a way to reach the trading credentials. On the operator's
 // machine that is the encrypted keystore. On a deployed droplet it is the
 // STRATS_RUNTIME_CREDS value, and there is no keystore at all. The Hyperliquid
-// master key is never read here.
+// master key is read here by loadWalletKey only, for a buyback.
 import { KeyRoles, addressFromPk, type Keystore } from "@quotient-forecasting/cassie-core";
 import type { Args } from "./args.js";
 import { normalizeGatewayUrl, type GatewayOptions } from "./client.js";
 import { ensureHome } from "./paths.js";
 import { RUNTIME_CREDS_ENV, decodeRuntimeCreds, type PolymarketCreds, type RuntimeCredsDoc } from "./runtime-creds.js";
 import { checkPassphrase, openKeystore, readPassphrase, readSecret, type Prompts } from "./setup.js";
-import { API_KEY_ROLE, isTwoVenueBot, loadBot, resolveBotId, type BotState } from "./state.js";
+import { API_KEY_ROLE, isPolymarketBot, isTwoVenueBot, loadBot, resolveBotId, type BotState } from "./state.js";
 
 export const POLYMARKET_L2_ROLE = "polymarket-l2";
 /** A two-venue bot's Polymarket signer. It is a key of its own, so deploying the bot never sends the Hyperliquid master key anywhere. */
@@ -98,10 +98,26 @@ export function loadPolymarketCreds(session: Session): PolymarketCreds {
   return { venue: "polymarket", signerPk, funder: bot.polymarket.funder, signatureType: bot.polymarket.signatureType, l2: { apiKey: l2.apiKey, secret: l2.secret, passphrase: l2.passphrase } };
 }
 
+/**
+ * The key of the bot's own wallet, which a buyback withdraws and swaps with. On the creator's machine it comes from the keystore.
+ * On a droplet it is there only when the creator turned auto-buyback on: a Hyperliquid bot's master key travels in its own arm of the
+ * runtime credentials, and a theme or team bot's wallet key is the Polymarket signer the droplet already holds. Null when there is none.
+ */
+export function loadWalletKey(session: Session): string | null {
+  const { bot } = session;
+  // A droplet's credentials are usable for a buyback only when the creator opted in.
+  if (session.runtime && bot.autoBuyback !== true) return null;
+  const key = session.runtime
+    ? session.runtime.buyback?.masterPk ?? (isPolymarketBot(bot) ? session.runtime.polymarket?.signerPk ?? null : null)
+    : readSecret(session.keystore!, bot.id, KeyRoles.master, session.passphrase!);
+  if (key && addressFromPk(key).toLowerCase() !== bot.masterAddress.toLowerCase()) throw new Error("The wallet key does not match this bot's wallet address.");
+  return key;
+}
+
 /** Every secret a session can reach, for scrubbing a line before it is printed or logged. */
 export function sessionSecrets(session: Session): Array<string | undefined> {
   const r = session.runtime;
-  return [session.gateway.apiKey, session.passphrase, r?.hyperliquid?.agentPk, r?.polymarket?.signerPk, r?.polymarket?.l2.secret, r?.polymarket?.l2.passphrase, r?.polymarket?.l2.apiKey];
+  return [session.gateway.apiKey, session.passphrase, r?.hyperliquid?.agentPk, r?.buyback?.masterPk, r?.polymarket?.signerPk, r?.polymarket?.l2.secret, r?.polymarket?.l2.passphrase, r?.polymarket?.l2.apiKey];
 }
 
 /** Remove any secret that an upstream error message might carry before a line is printed or logged. */

@@ -34,6 +34,9 @@ export const payoutsSummaryFile = (id: string): string => join(stateDir(), `${as
 /** The one buyback in flight, written before each step so a stopped run can be continued without paying twice. */
 export const buybackJournalFile = (id: string): string => join(stateDir(), `${assertBotId(id)}.buyback.json`);
 
+/** A droplet that buys back by itself only: the payout record and deposits figure strats deploy sent it. No secret. */
+export const buybackBasisFile = (id: string): string => join(stateDir(), `${assertBotId(id)}.buyback-basis.json`);
+
 /** mkdir honors the umask and ignores existing directories, so set the mode explicitly. */
 export function ensurePrivateDir(dir: string): void {
   mkdirSync(dir, { recursive: true, mode: 0o700 });

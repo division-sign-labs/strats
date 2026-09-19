@@ -1,13 +1,15 @@
 // strats status: everything worth knowing, read fresh from the gateway and the venue. Read-only.
 import type { Args } from "../args.js";
 import { fetchConfig, fetchTarget } from "../client.js";
+import { lastBuybackLine, pullRecord } from "../buyback/droplet.js";
+import { describeAutoBuyback } from "../buyback/text.js";
 import { describeDecision, px, reconcile, usd } from "../reconcile.js";
 import { sshExec } from "../deploy/ssh.js";
 import { payoutRows, summary } from "../payouts.js";
 import type { ConfigDoc } from "../protocol/index.js";
 import { openSession, type Session } from "../session.js";
 import type { Prompts } from "../setup.js";
-import { isPolymarketBot, isTwoVenueBot, pinnedDifferences, type BotState } from "../state.js";
+import { dropletBuysBack, isPolymarketBot, isTwoVenueBot, pinnedDifferences, type BotState } from "../state.js";
 import { Venue, toOrderView } from "../venue.js";
 import { describePublication } from "./config.js";
 import { chainName } from "./init.js";
@@ -33,6 +35,20 @@ export function showDeployment(bot: BotState): void {
   }
   row("Service", lines[0] ?? "unknown");
   for (const line of lines.slice(1)) console.log(`    ${line}`);
+  if (d.autoBuyback === true) {
+    // This droplet buys back by itself. Its payout lines are copied into this machine's record, so the profit split below counts them.
+    const pulled = pullRecord(bot, { moveJournal: false });
+    row("Last buyback", lastBuybackLine(bot) || "no buyback line in the droplet's log yet");
+    if (!pulled.ok) row("Payout record", `could not be copied from the droplet (${pulled.message}), so the profit split below may be out of date`);
+    else if (pulled.journal === "left") row("In flight", `a buyback is part-way (${pulled.stage}); the droplet continues it at its next check`);
+  }
+}
+
+/** The last line under "Profit split": who pays out, and when. */
+export function payoutNote(bot: BotState): string {
+  if (bot.deployment?.autoBuyback === true) return "  The droplet pays out by itself: it checks once a day and buys back when the buyback share is at least the minimum. strats buyback shows the plan; --execute is refused here meanwhile.";
+  if (dropletBuysBack(bot)) return "  Auto-buyback is on, and the droplet learns of it at the next strats deploy. Until then nothing is paid out.";
+  return "  Nothing is paid out by itself. strats buyback shows the plan; strats buyback --execute carries it out, from this machine only.";
 }
 
 export async function status(args: Args, prompts: Prompts): Promise<number> {
@@ -50,6 +66,7 @@ export async function status(args: Args, prompts: Prompts): Promise<number> {
   row("API key", `${bot.keyPrefix}...`);
   row("Ceiling", `${bot.ceilingPct}% of the wallet per position`);
   row("Project page", describePublication(bot));
+  row("Auto-buyback", describeAutoBuyback(bot));
 
   console.log("Settings");
   if (config.ok) {
@@ -117,7 +134,7 @@ export async function status(args: Args, prompts: Prompts): Promise<number> {
     row("Profit", `not shown: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (isTwoVenueBot(bot)) console.log("  The profit split counts the Hyperliquid account. What the Polymarket wallet earns is not split by strats buyback yet.");
-  console.log("  Nothing is paid out by itself. strats buyback shows the plan; strats buyback --execute carries it out, from this machine only.");
+  console.log(payoutNote(bot));
 
   console.log("Next cycle");
   const decision = reconcile(toReconcileInput({ ok: true, doc: target.value }, snap, Date.now(), config.ok ? config.value.config.account.positionPct : 0, bot.ceilingPct, true, openBlocked(config.ok ? config.value : undefined, config.ok ? "" : config.message, snap)));

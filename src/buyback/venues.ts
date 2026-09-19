@@ -3,12 +3,12 @@
 // goes to the bot's own wallet address, read from the bot file. No flag, no
 // document from Quotient and no quote can change where it goes.
 import { ExchangeClient, HttpTransport, InfoClient } from "@nktkas/hyperliquid";
-import { KeyRoles } from "@quotient-forecasting/cassie-core";
+import { KeyRoles, type SetupContext } from "@quotient-forecasting/cassie-core";
 import { privateKeyToAccount } from "viem/accounts";
 import { depositsLessWithdrawals, type PayoutSummary } from "../payouts.js";
 import { loadRuntimeState } from "../runtime-state.js";
-import { loadPolymarketCreds, type KeystoreSession } from "../session.js";
-import { makeSetupContext, readSecret, type Prompts } from "../setup.js";
+import { loadPolymarketCreds, loadWalletKey, type Session } from "../session.js";
+import { makeSetupContext, type Prompts } from "../setup.js";
 import { buildAdapter } from "../venue.js";
 import { PolymarketVenue, buildPolymarketAdapter } from "../venue-polymarket.js";
 import type { Journal } from "./journal.js";
@@ -37,7 +37,31 @@ const near = (value: unknown, target: number, below = 0): boolean => {
   return Number.isFinite(n) && n <= target + 0.005 && n >= target - below - 0.005;
 };
 
-export function hyperliquidVenue(session: KeystoreSession, dex: string, prompts: Prompts): BuybackVenuePort {
+/**
+ * What the adapter's withdrawal is handed. On the creator's machine it reads the keystore, as before. On a droplet that buys back
+ * by itself there is no keystore and no terminal: it answers the one thing a withdrawal asks for, the wallet key, stores nothing,
+ * and refuses every question, because nobody is there to answer one.
+ */
+export function withdrawalContext(session: Session, prompts: Prompts | undefined): SetupContext {
+  if (session.keystore && session.passphrase !== undefined && prompts) return makeSetupContext(session.bot.id, session.keystore, session.passphrase, prompts);
+  const nobody = async (): Promise<never> => {
+    throw new Error("This step asked a question, and nobody is at the droplet to answer it.");
+  };
+  return {
+    botId: session.bot.id,
+    ask: nobody, confirm: nobody, poll: nobody,
+    print: () => undefined,
+    getSecret: async (role) => (role === KeyRoles.master ? loadWalletKey(session) : null),
+    putSecret: async () => {
+      throw new Error("Nothing is stored on the droplet.");
+    },
+  };
+}
+
+/** Where a Polymarket bot's deposits figure comes from. The creator's machine reads its own record; the droplet reads what strats deploy sent. */
+export type DepositsSource = () => { netDepositsUsd?: number | undefined; netDepositsAt?: string | undefined };
+
+export function hyperliquidVenue(session: Session, dex: string, prompts?: Prompts): BuybackVenuePort {
   const { bot } = session;
   const acct = { venue: "hyperliquid" as const, masterAddress: bot.masterAddress, ...(bot.agentAddress ? { agentAddress: bot.agentAddress } : {}) };
   const user = bot.masterAddress as `0x${string}`;
@@ -62,7 +86,12 @@ export function hyperliquidVenue(session: KeystoreSession, dex: string, prompts:
       let moved = false;
       if (dex !== "") {
         // A HIP-3 dex holds its own collateral, and a withdrawal leaves from the main account: move it there first.
-        const masterPk = readSecret(session.keystore, bot.id, KeyRoles.master, session.passphrase);
+        let masterPk: string | null;
+        try {
+          masterPk = loadWalletKey(session);
+        } catch (error) {
+          throw new WithdrawNotSentError(message(error));
+        }
         if (!masterPk) throw new WithdrawNotSentError("The keystore has no wallet key.");
         const transport = new HttpTransport();
         const info = new InfoClient({ transport });
@@ -90,7 +119,7 @@ export function hyperliquidVenue(session: KeystoreSession, dex: string, prompts:
         }
       }
       try {
-        await adapter.withdraw(makeSetupContext(bot.id, session.keystore, session.passphrase, prompts), acct, { to: bot.masterAddress, amount });
+        await adapter.withdraw(withdrawalContext(session, prompts), acct, { to: bot.masterAddress, amount });
       } catch (error) {
         // These are raised before anything is signed, or are the venue's own refusal.
         if (venueRefused(error) || /^(nothing to withdraw|insufficient withdrawable balance|master key missing)/.test(message(error))) throw new WithdrawNotSentError(message(error), moved);
@@ -113,7 +142,7 @@ export function hyperliquidVenue(session: KeystoreSession, dex: string, prompts:
   };
 }
 
-export function polymarketVenue(session: KeystoreSession, prompts: Prompts): BuybackVenuePort {
+export function polymarketVenue(session: Session, prompts?: Prompts, deposits: DepositsSource = () => loadRuntimeState(session.bot.id)): BuybackVenuePort {
   const { bot } = session;
   if (!bot.polymarket) throw new BuybackRefusal("This bot has no Polymarket account yet. Run: strats init");
   const account = bot.polymarket;
@@ -124,9 +153,11 @@ export function polymarketVenue(session: KeystoreSession, prompts: Prompts): Buy
     label: "Polymarket",
 
     async figures(payouts) {
-      const state = loadRuntimeState(bot.id);
+      const state = deposits();
       if (state.netDepositsUsd === undefined) {
-        throw new BuybackRefusal("This machine has no record of what was deposited. Run strats fund here, or: strats buyback --set-deposits <usd>");
+        throw new BuybackRefusal(session.runtime
+          ? "The droplet was sent no deposits figure. On your own machine run strats fund, or strats buyback --set-deposits <usd>, then strats buyback --sync"
+          : "This machine has no record of what was deposited. Run strats fund here, or: strats buyback --set-deposits <usd>");
       }
       // Free collateral plus the positions Polymarket lists. A position it does not list is left out, which can only lower the payout.
       const snap = await new PolymarketVenue(account, loadPolymarketCreds(session), { readOnly: true }).snapshot([], []);
@@ -137,7 +168,7 @@ export function polymarketVenue(session: KeystoreSession, prompts: Prompts): Buy
       const adapter = buildPolymarketAdapter(loadPolymarketCreds(session));
       if (!adapter.withdraw) throw new WithdrawNotSentError("This version of the Polymarket adapter cannot withdraw.");
       try {
-        await adapter.withdraw(makeSetupContext(bot.id, session.keystore, session.passphrase, prompts), acct, { to: bot.masterAddress, amount: Number(usdAmount.toFixed(2)) });
+        await adapter.withdraw(withdrawalContext(session, prompts), acct, { to: bot.masterAddress, amount: Number(usdAmount.toFixed(2)) });
       } catch (error) {
         if (/^(nothing to withdraw|insufficient balance)/.test(message(error))) throw new WithdrawNotSentError(message(error));
         throw error;

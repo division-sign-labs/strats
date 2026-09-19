@@ -16,6 +16,9 @@ export type BuybackVenue = "hyperliquid" | "polymarket";
 export const HYPERLIQUID_WITHDRAWAL_FEE_USD = 1;
 export const MIN_USD_DEFAULT = 25;
 export const MIN_USD_FLOOR = 10;
+/** Percent. The defaults of strats buyback, and the only values the droplet's automatic buyback ever uses. */
+export const SLIPPAGE_DEFAULT = 1;
+export const MAX_IMPACT_DEFAULT = 3;
 
 export interface PlanInput {
   venue: BuybackVenue;

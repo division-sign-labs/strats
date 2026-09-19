@@ -7,6 +7,7 @@
 // strats fund and strats deploy run.
 import { KeyRoles, generateEoa } from "@quotient-forecasting/cassie-core";
 import { UsageError, type Args } from "../args.js";
+import { autoBuybackQuestion } from "../buyback/text.js";
 import { DEFAULT_GATEWAY_URL, discoverConfig, fetchConfigFor, normalizeGatewayUrl } from "../client.js";
 import { STAGE_NAMES, nextInitStage, type InitStage } from "../install.js";
 import { DEFAULT_BOT_ID, assertBotId, ensureHome, keysDir } from "../paths.js";
@@ -106,6 +107,13 @@ async function setup(args: Args, prompts: Prompts, id: string, gatewayUrl: strin
   const publishWallet = earlier?.publishWallet !== undefined
     ? earlier.publishWallet
     : prompts.interactive && (await prompts.confirm("Show this bot's trades on its public project page? The wallet address becomes public.", false));
+  // Asked once too, on a terminal only, and not when --no-deploy says there is no droplet. No flag answers it, and the default is no.
+  // Yes is the consent the droplet's unattended buyback runs on. strats config auto-buyback changes it.
+  const autoBuyback = earlier?.autoBuyback !== undefined
+    ? earlier.autoBuyback
+    : prompts.interactive && !args.flags.has("no-deploy")
+      ? await prompts.confirm(autoBuybackQuestion({ strategyId: config.value.config.strategyId }), false)
+      : undefined;
 
   const keystoreExists = keystore.exists(id);
   const passphrase = await readPassphrase(prompts, { create: !keystoreExists });
@@ -149,6 +157,7 @@ async function setup(args: Args, prompts: Prompts, id: string, gatewayUrl: strin
     ...(previous?.deployment ? { deployment: previous.deployment } : {}),
     ...(previous?.fundedAt ? { fundedAt: previous.fundedAt } : {}),
     publishWallet,
+    ...(autoBuyback !== undefined ? { autoBuyback } : {}),
     ceilingPct,
     // A destination pinned with strats buyback --to is this machine's choice, so reading the settings again keeps it.
     pinned: { token: account.token, split: account.split, ...(previous?.pinned.destination ? { destination: previous.pinned.destination } : {}) },
@@ -163,6 +172,7 @@ async function setup(args: Args, prompts: Prompts, id: string, gatewayUrl: strin
   console.log(`  Keystore         ${keysDir()} (encrypted)`);
   console.log(`  Ceiling          ${ceilingPct}% of the wallet per position`);
   console.log(`  Project page     ${publishWallet ? "shows the wallet address, as you chose" : "does not show the wallet address"}. To change it: strats config publish-wallet on|off`);
+  console.log(`  Auto-buyback     ${autoBuyback === true ? "on: the droplet buys back by itself, as you chose" : "off: buybacks are yours to run, with strats buyback --execute"}. To change it: strats config auto-buyback on|off`);
   console.log(`  Payout settings  pinned from this config; a later change on the server needs "strats config accept"`);
   console.log("");
   return { bot, keystore, passphrase, gateway: { gatewayUrl, apiKey } };

@@ -20,7 +20,7 @@ npx @quotient-forecasting/strats init --key qsk_...
 
 It works the same way for every strategy, and goes through these steps in order:
 
-1. **Settings.** Reads the settings you saved on TokenStrats and shows them. Asks for your local ceiling, whether to publish the wallet address (the default is no), and a keystore passphrase.
+1. **Settings.** Reads the settings you saved on TokenStrats and shows them. Asks for your local ceiling, whether to publish the wallet address (the default is no), whether the droplet should buy back by itself (the default is no; see "Automatic buybacks on the droplet"), and a keystore passphrase.
 2. **Wallet.** Creates the wallet on this machine and encrypts its keys. For a theme or team key, or a single-asset key with markets, it also creates the Polymarket account, which costs nothing.
 3. **Funding.** Shows the address and what to send, waits for the deposit, and moves it into the venue. You are asked before each transfer. A single-asset key with markets funds the perp first and Polymarket second, and the second can be skipped.
 4. **Deploy.** Puts the runner on a DigitalOcean droplet in your own account, in region `blr1` (Bangalore). It shows the plan, the monthly cost and exactly what will be sent to the droplet, and asks before creating anything.
@@ -123,9 +123,9 @@ A deployed runner keeps the choice it was deployed with until you run `strats de
 
 ### Keys
 
-A single-asset bot's keystore holds three entries: the master key (owns the funds, used only by `fund` and `buyback --execute`), the trading key (an approved Hyperliquid agent that can trade but cannot withdraw, used by `run` and `close`), and the API key.
+A single-asset bot's keystore holds three entries: the master key (owns the funds, used only by `fund` and `buyback --execute`, and sent to the droplet only if you turn auto-buyback on), the trading key (an approved Hyperliquid agent that can trade but cannot withdraw, used by `run` and `close`), and the API key.
 
-A single-asset bot with markets adds two: a Polymarket signer key of its own and the Polymarket API credentials. The signer is a separate key, so the Hyperliquid master key still never leaves this machine.
+A single-asset bot with markets adds two: a Polymarket signer key of its own and the Polymarket API credentials. The signer is a separate key, so trading the markets never sends the Hyperliquid master key anywhere.
 
 A theme or team bot's keystore holds the wallet key, the Polymarket API credentials, and the API key. Polymarket has no trading-only key: its SDK signs every order with the wallet's own key, and that key controls the deposit wallet that holds the funds. `run`, `status` and `close` therefore load it. Keep only what the bot needs in that wallet.
 
@@ -148,6 +148,7 @@ strats buyback --set-deposits <usd> [--id name]
 strats buyback --sync [--id name]
 strats config [show|accept] [--id name]
 strats config publish-wallet [on|off] [--id name]
+strats config auto-buyback [on|off] [--id name]
 ```
 
 **init** is the whole install, described under "Install". It reads your saved settings through the gateway and shows them, asks for your local ceiling, whether to publish the wallet address, and a keystore passphrase, creates the wallet, stores the API key encrypted, and pins the payout settings. For a theme or team key it also sets up the Polymarket account (a deposit wallet owned by the new key, API credentials, and the trading approvals, none of which cost anything). Then it runs the funding step and the deploy step, which are the same code as `fund` and `deploy`, and it asks for the passphrase only once. The key can also come from `STRATS_API_KEY` or a hidden prompt, which keeps it out of shell history.
@@ -170,13 +171,13 @@ Polymarket refuses orders from the United States and some other countries. A the
 
 **destroy** stops the runner and deletes the droplet and its firewall, after a y/N confirm. Positions and resting orders stay on the venue as they are. Billing for the droplet stops.
 
-**status** shows the wallet, equity, positions, the current targets and whether they are fresh, the config version, your ceiling, the pinned payout settings, the profit not yet split and what a buyback would pay, what was bought back so far, and, for a deployed bot, whether the service is active and its last 20 log lines, read over ssh with `journalctl -u strats@<id> -n 20 --no-pager`.
+**status** shows the wallet, equity, positions, the current targets and whether they are fresh, the config version, your ceiling, the pinned payout settings, the profit not yet split and what a buyback would pay, what was bought back so far, and, for a deployed bot, whether the service is active and its last 20 log lines, read over ssh with `journalctl -u strats@<id> -n 20 --no-pager`. It shows whether auto-buyback is on and, for a droplet that buys back by itself, the last buyback line of its log, after copying the droplet's payout lines into this machine's record so the profit split counts them.
 
 **close**, single asset: cancels our target, closes the position with a reduce-only order, and then cancels our stop, after a y/N confirm. It cancels orders by id and never uses cancel-all. `--coin` names the coin yourself when the gateway cannot be reached. **close**, theme: sells every position in a configured market at the bid, after a y/N confirm, and leaves positions in other markets alone. **close**, team: the same, for positions in the team's games. It reads the games from the targets first; when they cannot be read it sells nothing and lists what Polymarket shows for the wallet. A running bot will open again if the targets still say so, so stop it first if you want to stay out.
 
 **buyback** is described under "Buyback".
 
-**config** compares the server's settings with the pinned payout settings. `accept` shows the exact change and re-pins after a y/N confirm. `publish-wallet` shows or changes whether reports carry the wallet address; see "Publishing the wallet address".
+**config** compares the server's settings with the pinned payout settings. `accept` shows the exact change and re-pins after a y/N confirm. `publish-wallet` shows or changes whether reports carry the wallet address; see "Publishing the wallet address". `auto-buyback` shows or changes whether the droplet buys back by itself; see "Automatic buybacks on the droplet".
 
 For unattended runs on your own machine set `STRATS_PASSPHRASE`. Data lives in `~/.strats` (`STRATS_HOME` overrides): `keys/`, `bots/<id>.json`, `state/<id>.json`, `state/<id>.payouts.jsonl`, `logs/<id>.log`, `ssh/`.
 
@@ -210,12 +211,17 @@ One value, `STRATS_RUNTIME_CREDS`, in that 0600 file. It holds:
 - the API key and the gateway URL;
 - the bot file: addresses, your ceiling, the pinned payout settings, and your choice about publishing the wallet address, none of it secret;
 - for a single-asset bot, the Hyperliquid trading key and the wallet's public address. The trading key can place orders and cannot withdraw;
-- for a single-asset bot with markets, both: the Hyperliquid trading key, and the Polymarket signer key with its API credentials. The droplet holds the Polymarket signer key, so whoever controls the droplet controls the funds in the Polymarket wallet. It never holds the Hyperliquid master key;
+- for a single-asset bot with markets, both: the Hyperliquid trading key, and the Polymarket signer key with its API credentials. The droplet holds the Polymarket signer key, so whoever controls the droplet controls the funds in the Polymarket wallet. It holds the Hyperliquid master key only with auto-buyback on;
 - for a theme or team bot, the Polymarket wallet key, the deposit wallet's address and the Polymarket API credentials. There is no trading-only key on Polymarket, so whoever controls the droplet controls the funds in that wallet. `deploy` says so before it asks.
 
 After a buyback the droplet also receives `state/<id>.payouts.json`: the dollars bought back and the date and amount of each withdrawal, so its report shows the right totals. It holds no secret and gives the droplet nothing to act on.
 
-The keystore file and its passphrase never leave your machine, and neither does a Hyperliquid master key. `strats buyback` refuses to run on a droplet. The droplet has no keystore: `run` reads `STRATS_RUNTIME_CREDS` when it is set and uses it instead, then removes it from its own environment.
+With auto-buyback off, which is the default, that is everything, and it is exactly what earlier releases sent. With auto-buyback on, two things are added, and `deploy` says so before it asks:
+
+- for a single-asset bot, with or without markets, the wallet's master key. The droplet can then withdraw, so whoever controls the droplet controls the funds. A theme or team bot's droplet already holds its wallet key, so nothing is added for it;
+- `state/<id>.buyback-basis.json`: this machine's payout record and, for a Polymarket bot, its deposits figure. The droplet measures profit from them. No secret.
+
+The keystore file and its passphrase never leave your machine, and a Hyperliquid master key leaves it only when you turn auto-buyback on. The `strats buyback` command refuses to run on a droplet. The droplet has no keystore: `run` reads `STRATS_RUNTIME_CREDS` when it is set and uses it instead, then removes it from its own environment.
 
 ## What the runner does with a target
 
@@ -290,7 +296,7 @@ The Hyperliquid adapter this program uses only opens positions when the account 
 
 ## What this release does not do
 
-- Buybacks by themselves. Nothing is paid out until you run `strats buyback --execute` on your own machine and answer y.
+- Buybacks by themselves, unless you turn auto-buyback on. By default nothing is paid out until you run `strats buyback --execute` on your own machine and answer y.
 - Other withdrawals. The kept share of the profit, and your deposits, stay on the venue until you withdraw them with the wallet key using other tooling.
 - Single asset: more than one position. One asset, one position, no pyramiding.
 - Single asset with markets: a buyback from the Polymarket wallet. `strats buyback` splits the Hyperliquid account's profit only. Its markets have no stops, like a theme's.
@@ -301,7 +307,7 @@ The Hyperliquid adapter this program uses only opens positions when the account 
 
 ## Risk
 
-This software trades real money with no human in the loop. You can lose some or all of the funds in the wallet. Q's targets can be wrong. A prediction-market share pays nothing when its outcome does not happen. Stops are market orders triggered on the venue and can fill far from the stop price in a fast market or a gap, and perpetual positions pay or receive funding. Hyperliquid, the Arbitrum bridge, the gateway or your own machine can fail or be unreachable; while the runner is down, only the stop and target orders already resting on the venue protect a position. Anyone who has both the keystore file and its passphrase controls the wallet, and there is no recovery if you lose either. Anyone who gains control of a deployed droplet can trade a single-asset bot's account and can take a theme or team bot's funds. A buyback swaps through LI.FI and the bridges and exchanges it routes to; a thin token can fill badly inside the slippage you allow, and a bridge can fail or hold funds. The software is provided as is, without warranty, under the Apache-2.0 license. Start with `--dry-run`, then with an amount you can afford to lose.
+This software trades real money with no human in the loop. You can lose some or all of the funds in the wallet. Q's targets can be wrong. A prediction-market share pays nothing when its outcome does not happen. Stops are market orders triggered on the venue and can fill far from the stop price in a fast market or a gap, and perpetual positions pay or receive funding. Hyperliquid, the Arbitrum bridge, the gateway or your own machine can fail or be unreachable; while the runner is down, only the stop and target orders already resting on the venue protect a position. Anyone who has both the keystore file and its passphrase controls the wallet, and there is no recovery if you lose either. Anyone who gains control of a deployed droplet can trade a single-asset bot's account and can take a theme or team bot's funds. With auto-buyback on, a single-asset bot's droplet holds the master key too, so they can take its funds as well, and buybacks move real money with nobody watching. A buyback swaps through LI.FI and the bridges and exchanges it routes to; a thin token can fill badly inside the slippage you allow, and a bridge can fail or hold funds. The software is provided as is, without warranty, under the Apache-2.0 license. Start with `--dry-run`, then with an amount you can afford to lose.
 
 ## Development
 
@@ -311,7 +317,7 @@ npm test        # unit tests: both decision functions, protocol, client, venues,
 npm run build
 ```
 
-`src/reconcile.ts` and `src/reconcile-theme.ts` are the decision functions: pure, no I/O, fully tested. A team bot uses `reconcileTheme` unchanged; `src/team-markets.ts` is the pure check that decides which games it may trade. `src/venue.ts` and `src/venue-polymarket.ts` are the only files that place orders. `src/commands/fund.ts` and `src/buyback/` are the only code that causes a Hyperliquid master key to be read. In `src/buyback/`, `plan.ts` is the money arithmetic, `lifi.ts` the quote checks, `machine.ts` the recorded sequence and every way of resuming it, all tested with fakes; `venues.ts` and `chain.ts` are the only files that withdraw, approve or swap. `src/runtime-creds.ts` defines, with a strict schema, everything a droplet can receive. `src/install.ts` is the pure function that decides which step of `init` comes next. `src/report.ts` builds the report, and `src/protocol/index.ts` holds the schema every report is checked against before it is sent. `src/deploy/` is adapted from the deploy code in cassie (Apache-2.0, same organisation); each file names its source.
+`src/reconcile.ts` and `src/reconcile-theme.ts` are the decision functions: pure, no I/O, fully tested. A team bot uses `reconcileTheme` unchanged; `src/team-markets.ts` is the pure check that decides which games it may trade. `src/venue.ts` and `src/venue-polymarket.ts` are the only files that place orders. `src/commands/fund.ts` and `src/buyback/` are the only code that causes a Hyperliquid master key to be read, and `src/commands/deploy.ts` reads it for the droplet only when the bot file says `autoBuyback`. `src/buyback/auto.ts` is the droplet's unattended buyback and its daily schedule, `basis.ts` and `droplet.ts` move the payout record between the two machines; all three are tested with fakes. In `src/buyback/`, `plan.ts` is the money arithmetic, `lifi.ts` the quote checks, `machine.ts` the recorded sequence and every way of resuming it, all tested with fakes; `venues.ts` and `chain.ts` are the only files that withdraw, approve or swap. `src/runtime-creds.ts` defines, with a strict schema, everything a droplet can receive. `src/install.ts` is the pure function that decides which step of `init` comes next. `src/report.ts` builds the report, and `src/protocol/index.ts` holds the schema every report is checked against before it is sent. `src/deploy/` is adapted from the deploy code in cassie (Apache-2.0, same organisation); each file names its source.
 
 ## Back a team
 
@@ -405,10 +411,31 @@ One buyback is in flight at most, and a new one is refused while the record exis
 
 If a run stops with "Another transaction used this wallet", check the explorer page it names. When the swap is not there, the money is still in the wallet; remove `state/<id>.buyback.json` yourself and move the money as you see fit. The withdrawal stays counted.
 
+### Automatic buybacks on the droplet
+
+Off by default. `strats init` asks once, on a terminal: "Buy back automatically? This puts your wallet key on your droplet, so the droplet can withdraw." To change it later:
+
+```
+strats config auto-buyback          # shows the current choice
+strats config auto-buyback on       # asks y/N first
+strats config auto-buyback off
+strats deploy                       # the droplet keeps the old setting until this
+```
+
+What you give up: a single-asset bot's droplet normally holds a trading key that cannot withdraw. With auto-buyback on it holds the wallet's master key. A theme or team bot's droplet already holds its wallet key, so it gives up nothing new. It is still your droplet and your keys; Quotient holds nothing.
+
+What the droplet does: 10 minutes after the runner starts, and then once every 24 hours, it runs the same buyback as `strats buyback --execute`, with the same arithmetic, the $25 minimum, 1% slippage, the 3% price-impact limit, the same quote and gas checks, and the same record. A buyback that is part-way is continued before anything new is planned. No question is asked, because nobody is there: the y you gave to `init` or `config` is the consent, and the code refuses unless the bot file says `autoBuyback` and it is running from the credentials `strats deploy` sent. It runs beside the trading loops, never inside a cycle, one at a time. An error is one log line, and the next daily check is the retry. Each line starts with `buyback`, and a finished one reads "Bought 1,000,000 TKN for $349.00. ...". The next report's `boughtBackUsd` includes it.
+
+One place pays. While auto-buyback is on and the bot is deployed, `strats buyback --execute` on your machine refuses: "The droplet does the buybacks for this bot ...". The dry run still works and first copies the droplet's payout lines, so "Already split" is right. `strats status` shows the droplet's last buyback line. To do one by hand, turn it off and deploy; that deploy stops the runner, brings the droplet's payout record home, and moves a part-way buyback to your machine, where `strats buyback --execute` finishes it. `strats destroy` brings the record home too. If the droplet cannot be read, both refuse rather than lose the only copy; `--force` goes on without it, and then check "Already split" before you say y to a buyback. A deploy that would replace the droplet while a buyback is part-way is refused.
+
+Polymarket bots: profit is measured from the deposits figure on your machine, which deploy sends. `strats fund` pauses the droplet's buyback before the deposit arrives and sends the new figure after. Money sent to the Polymarket wallet any other way reads as profit, and the droplet would spend the buyback share of it on your token with nobody to notice. Use `strats fund`, or fix the figure with `--set-deposits` and send it with `--sync`.
+
+Keep gas in the wallet (ETH on Arbitrum, POL on Polygon). Without it the droplet sends nothing and says how much to add.
+
 ### Other forms
 
-`--to <address>` pins where the bought token goes, after showing the old and new address and asking y/N. `--to wallet` returns to the bot's own wallet. `--sync` sends the droplet the buyback totals for its public report; a failed send after a buyback is reported and does not change the result.
+`--to <address>` pins where the bought token goes, after showing the old and new address and asking y/N. `--to wallet` returns to the bot's own wallet. `--sync` sends the droplet the buyback totals for its public report; a failed send after a buyback is reported and does not change the result. To a droplet that buys back by itself it sends this machine's deposits figure and payout record instead.
 
 ### Not yet exercised with real money
 
-No withdrawal, approval or swap has been run for real from this code. The tests use stand-ins for the venue, the wallet and LI.FI, and the dry run reads live data and a live quote. Two points to watch on the first real run: whether Hyperliquid's history records the amount asked for or the amount after its $1 fee (the code accepts either), and the move from a HIP-3 dex to the main account before a withdrawal. Polymarket buybacks depend on LI.FI routing pUSD; when it offers no route the command says so and tries nothing else.
+No withdrawal, approval or swap has been run for real from this code, by hand or by a droplet. Run `strats buyback --execute` by hand at least once before you turn auto-buyback on. The tests use stand-ins for the venue, the wallet and LI.FI, and the dry run reads live data and a live quote. Two points to watch on the first real run: whether Hyperliquid's history records the amount asked for or the amount after its $1 fee (the code accepts either), and the move from a HIP-3 dex to the main account before a withdrawal. Polymarket buybacks depend on LI.FI routing pUSD; when it offers no route the command says so and tries nothing else.

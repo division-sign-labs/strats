@@ -1,5 +1,6 @@
 // strats destroy: stop the runner, delete the droplet and its firewall. Positions are not touched.
 import type { Args } from "../args.js";
+import { pullRecord } from "../buyback/droplet.js";
 import { DigitalOceanError, ensureDigitalOceanReady } from "../deploy/digitalocean.js";
 import { forgetHostKey, sshExec } from "../deploy/ssh.js";
 import { ensureHome } from "../paths.js";
@@ -24,6 +25,17 @@ export async function destroy(args: Args, prompts: Prompts): Promise<number> {
   const { client } = await ensureDigitalOceanReady(prompts);
   prompts.close();
   sshExec({ host, user: "root" }, `systemctl stop ${unitName(bot.id)}`, undefined, { timeoutMs: 45_000 });
+  if (bot.deployment.autoBuyback === true) {
+    // This droplet bought back by itself, so it holds the only copy of what it paid out. That comes home before the droplet goes.
+    const pulled = pullRecord(bot, { moveJournal: true });
+    if (!pulled.ok && !args.flags.has("force")) {
+      sshExec({ host, user: "root" }, `systemctl start ${unitName(bot.id)}`, undefined, { timeoutMs: 45_000 });
+      console.log(`The droplet's payout record could not be read (${pulled.message}). It is the only copy of what the droplet paid out, so nothing was deleted. Try again. If the droplet is gone for good, add --force.`);
+      return 1;
+    }
+    if (!pulled.ok) console.log(`The droplet's payout record could not be read (${pulled.message}). Going on because of --force. What it paid out is missing from this machine's record: check the "Already split" line of strats buyback before you say yes to one.`);
+    else console.log(`The droplet's payout record is on this machine now.${pulled.journal === "moved" ? " A buyback that was part-way moved here too. To finish it: strats buyback --execute" : ""}`);
+  }
   try {
     await client.deleteDroplet(dropletId);
   } catch (error) {

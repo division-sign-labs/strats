@@ -1,9 +1,11 @@
 // strats fund: move USDC from Arbitrum into Hyperliquid and approve a trading
-// key. This is the only command that reads the master key. Everything it signs
+// key. It reads the master key, as buyback --execute does, and as deploy does
+// only when the creator turned auto-buyback on. Everything it signs
 // is signed on this machine by the cassie-core funding flow. strats init runs
 // the same code as its funding step. A single-asset bot that also trades markets
 // has two funding steps, one per venue; --venue polymarket names the second.
 import { UsageError, type Args } from "../args.js";
+import { pushBasis } from "../buyback/droplet.js";
 import { fetchTarget } from "../client.js";
 import { isFunded } from "../install.js";
 import { loadRuntimeState, saveRuntimeState } from "../runtime-state.js";
@@ -58,6 +60,17 @@ async function fundPolymarket(session: KeystoreSession, prompts: Prompts, opts: 
   // A setup that was stopped after the deposit arrived must not wait for a second one.
   const fundedBefore = twoVenue ? bot.markets?.fundedAt !== undefined : isFunded(bot);
   const skipDepositWait = !fundedBefore && before !== undefined && before >= ALREADY_FUNDED_USD;
+  // A droplet that buys back by itself measures profit from the deposits figure this machine sends it. It is paused before the
+  // deposit can arrive, so the new money is never measured as profit, and told the new figure once it is recorded below.
+  const tellDroplet = !twoVenue && bot.deployment?.autoBuyback === true;
+  if (tellDroplet) {
+    const paused = pushBasis(bot, { hold: true });
+    if (!paused.ok) {
+      console.log(`The droplet's automatic buyback could not be paused (${paused.message}), and a deposit that arrives while it runs would be measured as profit. Nothing was changed. Try again, or turn auto-buyback off and run strats deploy first.`);
+      return 1;
+    }
+    console.log("The droplet's automatic buyback is paused until this deposit is recorded. If you stop before then, it stays paused until strats fund finishes.");
+  }
   if (skipDepositWait) console.log(`The deposit wallet already holds ${before!.toFixed(2)} pUSD, so this does not wait for another deposit. It checks the trading approvals.`);
   else sayHowToStop(prompts, opts.chained === true);
   await adapter.runFundingFlow(makeSetupContext(bot.id, session.keystore, session.passphrase, prompts, { skipDepositWait, masterRole: polymarketSignerRole(bot) }), acct);
@@ -69,6 +82,12 @@ async function fundPolymarket(session: KeystoreSession, prompts: Prompts, opts: 
     if (state.netDepositsUsd === undefined) saveRuntimeState(bot.id, { ...state, netDepositsUsd: after, netDepositsAt: new Date().toISOString() }, scope);
     else if (arrived > 0.01) saveRuntimeState(bot.id, { ...state, netDepositsUsd: state.netDepositsUsd + arrived }, scope);
     console.log(`Deposit wallet balance: ${after.toFixed(2)} pUSD.`);
+  }
+  if (tellDroplet) {
+    const resumed = after !== undefined ? pushBasis(bot) : { ok: false as const, message: "the deposit wallet could not be read, so the deposit was not recorded" };
+    console.log(resumed.ok
+      ? "The droplet has the new deposits figure, and its automatic buyback is on again."
+      : `The droplet's automatic buyback stays paused (${resumed.message}). To send it the deposits figure and resume it: strats buyback --sync`);
   }
   // A two-venue bot records this step on its own, so the perp's funding step is never taken for it.
   session.bot = twoVenue ? { ...bot, markets: { fundedAt: new Date().toISOString() } } : { ...bot, fundedAt: new Date().toISOString() };
