@@ -162,9 +162,12 @@ export async function ensureDigitalOceanReady(prompts: Prompts): Promise<{ clien
       console.log(`The DigitalOcean token from ${found.origin} was rejected.`);
     }
   }
-  console.log("DigitalOcean bills your own account for the droplet.");
-  console.log(`Create an API token with read and write scope at ${TOKEN_PAGE}`);
-  const token = (await prompts.ask("Paste the token", { secret: true })).trim();
+  // Two sentences: where to make one, and how to hand it over. The token is never printed.
+  const where = `The droplet is created in your own DigitalOcean account, which DigitalOcean bills directly, so this step needs an API token with read and write scope from ${TOKEN_PAGE}`;
+  if (!prompts.interactive) throw new Error(`${where}. Set it as DIGITALOCEAN_TOKEN and run this command again.`);
+  console.log(`${where}.`);
+  console.log(`Paste it at the prompt below, where it is not shown and is saved to ${tokenPath()} with owner-only permissions, or set DIGITALOCEAN_TOKEN and run this command again.`);
+  const token = (await prompts.ask("DigitalOcean token", { secret: true })).trim();
   if (!token) throw new Error("No DigitalOcean token entered.");
   const client = new DigitalOcean(token);
   const { account } = await client.account();

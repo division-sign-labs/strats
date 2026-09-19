@@ -1,6 +1,6 @@
 {
   "name": "@quotient-forecasting/strats",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Non-custodial runner for TokenStrats: reads declarative targets from Quotient and trades them from your own wallet on Hyperliquid or Polymarket",
   "license": "Apache-2.0",
   "type": "module",

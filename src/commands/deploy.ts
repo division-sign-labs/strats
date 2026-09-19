@@ -3,7 +3,7 @@
 // find a token, make an ssh key, create the droplet with cloud-init that holds
 // no secrets, firewall to port 22, pin the host key, wait for first boot, push
 // the credentials over ssh stdin into a 0600 file, start the systemd unit, and
-// poll until it is active.
+// poll until it is active. strats init runs the same code as its last step.
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,13 +18,36 @@ import { remoteWriteCommand } from "../deploy/remote-write.js";
 import { ensureKeypair, forgetHostKey, pinHostKey, restrictedChildEnv, scpTo, sshExec, sshExecOrThrow, type Target } from "../deploy/ssh.js";
 import { ensureHome } from "../paths.js";
 import { RUNTIME_CREDS_ENV, buildRuntimeCreds, encodeRuntimeCreds } from "../runtime-creds.js";
-import { loadAgentKey, loadPolymarketCreds, openSession, requireKeystore, runtimeCredsPresent } from "../session.js";
+import { loadAgentKey, loadPolymarketCreds, openSession, requireKeystore, runtimeCredsPresent, type KeystoreSession } from "../session.js";
 import type { Prompts } from "../setup.js";
 import { loadBot, resolveBotId, saveBot, type BotState } from "../state.js";
 import { packageRoot, packageVersion } from "../version.js";
 
 /** Polymarket refuses orders from the United States, so a theme bot is never placed there. */
 export const US_REGION_SLUGS = ["nyc1", "nyc2", "nyc3", "sfo1", "sfo2", "sfo3", "atl1"];
+
+/** Plain names for the regions people pick. Any other slug is shown as it is. */
+const REGION_NAMES: Record<string, string> = {
+  blr1: "Bangalore", sgp1: "Singapore", syd1: "Sydney", fra1: "Frankfurt", ams3: "Amsterdam", lon1: "London", tor1: "Toronto",
+  nyc1: "New York", nyc2: "New York", nyc3: "New York", sfo2: "San Francisco", sfo3: "San Francisco", atl1: "Atlanta",
+};
+export const regionLabel = (slug: string): string => (REGION_NAMES[slug] ? `${slug} (${REGION_NAMES[slug]})` : slug);
+
+export const PROJECTS_URL = "https://tokenstrats.xyz/projects";
+
+/** How to watch a deployed bot. Printed by deploy, and so by init. */
+export function watchLines(bot: BotState): string[] {
+  return [
+    "Watch it",
+    "  strats status    the wallet, positions, targets and the runner's last lines",
+    "  strats logs      the runner's log; add --follow to keep reading",
+    `  ${PROJECTS_URL}    the public project page. The runner's first report arrives within a few minutes.`,
+    bot.publishWallet === true
+      ? "  The wallet address is published with each report, as you chose. To stop: strats config publish-wallet off, then strats deploy."
+      : "  The wallet address is not published. The page shows the totals, positions and trades the runner reports.",
+    "To stop paying for the droplet: strats destroy",
+  ];
+}
 
 export const dropletName = (botId: string): string => `strats-${botId}`;
 export const unitName = (botId: string): string => `strats@${botId}`;
@@ -36,7 +59,7 @@ export function monthlyCost(size: string): string {
 
 /** What the droplet receives, in plain words. Shown before anything is created. */
 export function disclosure(bot: BotState): string[] {
-  const common = ["the API key", "this bot's settings file, which holds addresses and percentages only"];
+  const common = ["the API key", `this bot's settings file, which holds addresses, percentages and your choice about publishing the wallet (${bot.publishWallet === true ? "published" : "not published"}), and nothing secret`];
   if (bot.strategyId === "theme") {
     return [
       `Sent to the droplet over ssh: ${common.join("; ")}; the Polymarket wallet key and its API credentials.`,
@@ -51,7 +74,7 @@ export function disclosure(bot: BotState): string[] {
 }
 
 function readiness(bot: BotState): string | null {
-  if (bot.strategyId === "theme") return bot.polymarket ? null : "This bot has no Polymarket account yet. Run: strats init --force";
+  if (bot.strategyId === "theme") return bot.polymarket ? null : "This bot has no Polymarket account yet. Run: strats init";
   return bot.agentAddress ? null : "This bot has no approved trading key yet. Run: strats fund";
 }
 
@@ -103,7 +126,7 @@ function writeRemote(target: Target, path: string, content: string, mode: string
 function printPlan(bot: BotState, region: string, size: string, version: string, source: string): void {
   console.log(`Deploy bot "${bot.id}" (${bot.strategyId === "theme" ? "your own theme, on Polymarket" : "single asset, on Hyperliquid"})`);
   console.log(`  Droplet          ${dropletName(bot.id)}, ${DROPLET_IMAGE}`);
-  console.log(`  Region           ${region}`);
+  console.log(`  Region           ${regionLabel(region)}`);
   console.log(`  Size             ${size}, ${monthlyCost(size)}`);
   console.log(`  Runner           ${RUNNER_PACKAGE}@${version}, ${source}`);
   console.log(`  Runs as          systemd unit ${unitName(bot.id)}, restarted if it stops: strats run --id ${bot.id}`);
@@ -113,12 +136,17 @@ function printPlan(bot: BotState, region: string, size: string, version: string,
 }
 
 export async function deploy(args: Args, prompts: Prompts): Promise<number> {
+  return deployBot(args, prompts);
+}
+
+/** The deploy itself. `open` is a session that is already open, so strats init does not ask for the passphrase twice. */
+export async function deployBot(args: Args, prompts: Prompts, open?: KeystoreSession): Promise<number> {
   if (runtimeCredsPresent()) throw new Error("strats deploy runs on your own machine, not on the droplet.");
   ensureHome();
   const region = args.values.region ?? DEFAULT_REGION;
   const size = args.values.size ?? DEFAULT_SIZE;
   if (!/^[a-z0-9-]{2,40}$/.test(region) || !/^[a-z0-9-]{2,60}$/.test(size)) throw new Error("--region and --size take DigitalOcean slugs such as blr1 and s-1vcpu-1gb.");
-  const bot = loadBot(resolveBotId(args.values.id));
+  const bot = open?.bot ?? loadBot(resolveBotId(args.values.id));
   const version = packageVersion();
   if (bot.strategyId === "theme" && US_REGION_SLUGS.includes(region)) {
     throw new Error(`Polymarket refuses orders from the United States, and ${region} is a US region. Choose another, for example --region ${DEFAULT_REGION}.`);
@@ -162,7 +190,7 @@ export async function deploy(args: Args, prompts: Prompts): Promise<number> {
     return 0;
   }
 
-  const session = requireKeystore(await openSession(args, prompts), "deploy");
+  const session = open ?? requireKeystore(await openSession(args, prompts), "deploy");
   prompts.close();
   const creds = encodeRuntimeCreds(buildRuntimeCreds({
     apiKey: session.gateway.apiKey,
@@ -200,7 +228,8 @@ export async function deploy(args: Args, prompts: Prompts): Promise<number> {
   const host = publicIpv4(droplet);
   if (!host) throw new Error("The droplet came up without a public IPv4 address.");
   // Record it at once, so a later failure still leaves `strats destroy` able to find the droplet.
-  let saved: BotState = { ...bot, deployment: { dropletId: droplet.id, host, region: droplet.region.slug, size: droplet.size_slug, version, deployedAt: new Date().toISOString() } };
+  // `pending` stays until the runner is confirmed active, so a deploy stopped halfway is finished by strats deploy or strats init, not taken for done.
+  let saved: BotState = { ...bot, deployment: { dropletId: droplet.id, host, region: droplet.region.slug, size: droplet.size_slug, version, deployedAt: new Date().toISOString(), pending: true } };
   saveBot(saved);
 
   await client.upsertFirewall(name, droplet.id).catch((error: unknown) => {
@@ -208,12 +237,14 @@ export async function deploy(args: Args, prompts: Prompts): Promise<number> {
   });
 
   const target: Target = { host, user: "root" };
-  if (!reuse) {
+  // A droplet from a deploy that was stopped halfway may not have its host key pinned or its first boot finished. Both checks are safe to repeat.
+  const firstBoot = !reuse || bot.deployment?.pending === true;
+  if (firstBoot) {
     console.log("Reading the host key.");
     await pinHostKey(host);
   }
   await waitFor("Waiting for ssh", 5_000, 60, () => (sshExec(target, "true", undefined, { timeoutMs: 20_000 }).ok ? true : null));
-  if (!reuse) {
+  if (firstBoot) {
     await waitFor("Running first-boot setup (a few minutes)", 10_000, 90, () => (sshExec(target, `test -f ${READY_MARKER} && command -v node >/dev/null`, undefined, { timeoutMs: 20_000 }).ok ? true : null));
   }
 
@@ -245,14 +276,15 @@ export async function deploy(args: Args, prompts: Prompts): Promise<number> {
   sshExecOrThrow(target, `systemctl daemon-reload && systemctl enable ${unitName(bot.id)} && systemctl restart ${unitName(bot.id)}`);
   await waitFor("Starting the runner", 3_000, 30, () => (sshExec(target, `systemctl is-active --quiet ${unitName(bot.id)}`, undefined, { timeoutMs: 20_000 }).ok ? true : null));
 
-  saved = { ...saved, deployment: { ...saved.deployment!, deployedAt: new Date().toISOString() } };
+  const { pending: _pending, ...confirmed } = saved.deployment!;
+  saved = { ...saved, deployment: { ...confirmed, deployedAt: new Date().toISOString() } };
   saveBot(saved);
   console.log("");
-  console.log(`The runner is active on ${host} (${droplet.region.slug}, ${droplet.size_slug}).`);
+  console.log(`The runner is active on ${host} (${regionLabel(droplet.region.slug)}, ${droplet.size_slug}).`);
   console.log(`Cost: $${droplet.size?.price_monthly ?? SIZE_MONTHLY_USD[size] ?? "?"} per month, billed by DigitalOcean until you run strats destroy.`);
   const tail = sshExec(target, `journalctl -u ${unitName(bot.id)} -n 5 --no-pager -o cat`, undefined, { timeoutMs: 20_000 });
   if (tail.ok && tail.stdout.trim()) console.log(tail.stdout.trim());
   console.log("");
-  console.log("Next: strats logs, strats status. To stop paying for it: strats destroy");
+  for (const line of watchLines(saved)) console.log(line);
   return 0;
 }

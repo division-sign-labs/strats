@@ -7,11 +7,11 @@ import { runLoop } from "../loop.js";
 import { appendLog } from "../paths.js";
 import type { ThemeConfigDoc } from "../protocol/index.js";
 import { describeThemeDecision, reconcileTheme, themeHoldReason, type ThemeTargetsInput } from "../reconcile-theme.js";
-import { Reporter } from "../report.js";
-import { loadRuntimeState, saveRuntimeState } from "../runtime-state.js";
+import { Reporter, polymarketPositions, publishedWalletAddress, toReportTrade } from "../report.js";
+import { appendTrade, loadRuntimeState, saveRuntimeState } from "../runtime-state.js";
 import { loadPolymarketCreds, scrub, sessionSecrets, type Session } from "../session.js";
 import { pinnedDifferences } from "../state.js";
-import { PolymarketVenue, polymarketGeoblock, type PolymarketSnapshot } from "../venue-polymarket.js";
+import { PolymarketVenue, polymarketGeoblock, type PmActionResult, type PolymarketSnapshot } from "../venue-polymarket.js";
 
 const CONFIG_REFRESH_MS = 5 * 60_000;
 const GEOBLOCK_RECHECK_MS = 15 * 60_000;
@@ -28,7 +28,7 @@ export interface ThemeRunOptions {
 export async function runTheme(_args: Args, session: Session, opts: ThemeRunOptions): Promise<number> {
   const { bot } = session;
   const { dryRun } = opts;
-  if (!bot.polymarket) throw new Error("This bot has no Polymarket account yet. Run: strats init --force");
+  if (!bot.polymarket) throw new Error("This bot has no Polymarket account yet. Run: strats init");
   // Polymarket reads need the signed client, so a dry run loads the credentials too. It gets a venue that refuses every order.
   const creds = loadPolymarketCreds(session);
   const venue = new PolymarketVenue(bot.polymarket, creds, { readOnly: dryRun });
@@ -50,6 +50,8 @@ export async function runTheme(_args: Args, session: Session, opts: ThemeRunOpti
   let blocked = false;
   let lastSnap: PolymarketSnapshot | undefined;
   let lastAction = "";
+  /** An order was acknowledged after the snapshot the report would read, so the early report waits for the next snapshot. */
+  let tradedSinceSnapshot = false;
   const reporter = new Reporter(session.gateway, "theme", bot.id, opts.report && !dryRun);
 
   const cycle = async (): Promise<string> => {
@@ -91,6 +93,11 @@ export async function runTheme(_args: Args, session: Session, opts: ThemeRunOpti
     const tokenIds = [...targets.doc.targets.map((t) => t.tokenId), ...targets.doc.closed.map((c) => c.tokenId)];
     const snap = await venue.snapshot(markets, tokenIds);
     lastSnap = snap;
+    if (tradedSinceSnapshot) {
+      // This snapshot shows the position the last order made, so the report that follows this cycle is sent early.
+      tradedSinceSnapshot = false;
+      reporter.requestPrompt();
+    }
 
     const state = loadRuntimeState(bot.id);
     if (state.netDepositsUsd === undefined && snap.equityUsd > 0) {
@@ -119,16 +126,26 @@ export async function runTheme(_args: Args, session: Session, opts: ThemeRunOpti
       saveRuntimeState(bot.id, state);
     };
     const texts: string[] = [];
+    // Display only: the last trades this runner made, for the report.
+    const remember = (result: PmActionResult, question: string | undefined): void => {
+      if (!result.trade) return;
+      const trade = toReportTrade({ at: Date.now(), label: question || "Polymarket market", ...result.trade });
+      if (trade) state.trades = appendTrade(state.trades, trade);
+      tradedSinceSnapshot = true;
+    };
     for (const action of decision.actions) {
       const stamp = new Date().toISOString();
       if (action.kind === "redeem") {
         // Recorded before it is sent: a redemption is never submitted twice, whatever happens next.
         state.redeemed[action.conditionId] = stamp;
         save();
-        texts.push((await venue.redeem(action, marketOf(action.conditionId), snap)).text);
+        const result = await venue.redeem(action, marketOf(action.conditionId), snap);
+        remember(result, marketOf(action.conditionId)?.question);
+        texts.push(result.text);
       } else if (action.kind === "sell") {
         const result = await venue.sell(action, marketOf(action.conditionId));
         state.volumeUsd += result.filledUsd;
+        remember(result, marketOf(action.conditionId)?.question);
         texts.push(result.text);
       } else {
         const market = marketOf(action.conditionId);
@@ -137,6 +154,7 @@ export async function runTheme(_args: Args, session: Session, opts: ThemeRunOpti
         state.volumeUsd += result.filledUsd;
         if (result.filledUsd > 0) state.entered[action.targetId] = stamp;
         if (result.uncertain) state.attempted[action.targetId] = stamp;
+        remember(result, market.question || action.question);
         texts.push(result.text);
       }
       save();
@@ -153,13 +171,17 @@ export async function runTheme(_args: Args, session: Session, opts: ThemeRunOpti
       const failure = await reporter.maybeSend(Date.now(), scrub(lastAction || line.replace(/^theme\s+/, ""), secrets), async () => {
         if (!lastSnap) return null;
         const state = loadRuntimeState(bot.id);
-        const configured = new Set((config?.config.strategy.markets ?? []).flatMap((m) => m.tokenIds));
+        const markets = config?.config.strategy.markets ?? [];
+        const configured = new Set(markets.flatMap((m) => m.tokenIds));
         return {
           venue: "polymarket",
           equityUsd: lastSnap.equityUsd,
           netDepositsUsd: state.netDepositsUsd ?? lastSnap.equityUsd,
           volumeUsd: state.volumeUsd,
           openPositions: lastSnap.holdings.filter((h) => configured.has(h.tokenId)).length,
+          positions: polymarketPositions(lastSnap.holdings, markets),
+          trades: state.trades,
+          walletAddress: publishedWalletAddress(bot),
         };
       });
       if (failure) emit(failure);

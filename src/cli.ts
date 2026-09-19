@@ -12,18 +12,25 @@ single-asset strategy, Polymarket markets for a theme strategy. Non-custodial:
 Quotient never holds a key and nothing it receives feeds a decision.
 
 Usage
-  strats init --key qsk_... [--ceiling N] [--id name] [--gateway url] [--force]
-      Read the settings, create the wallet and keystore, pin the payout settings.
-      A theme key also sets up the Polymarket account and prints the deposit address.
+  strats init --key qsk_... [--ceiling N] [--id name] [--gateway url] [--no-deploy] [--region blr1] [-y] [--force]
+      The whole install. Read the settings, create the wallet and keystore, pin the payout settings,
+      show the address to fund and wait for the deposit, then deploy the runner to a droplet (blr1, Bangalore).
+      A theme key also sets up the Polymarket account. Asks once whether to publish the wallet address; the default is no.
+      Stop at any point with Ctrl-C and run strats init again: it continues where it stopped and keeps the wallet.
+      --no-deploy stops after funding; strats run then runs the bot on this machine. -y accepts the deploy question.
+      --region, --size and --from-tarball apply to the deploy step, as in strats deploy.
+      --force reads the settings again and replaces them; the wallet is kept.
       The key can also come from STRATS_API_KEY or a prompt, which keeps it out of shell history.
   strats fund [--id name] [--dex name]
+      The funding step of init, on its own, and the way to add funds later.
       Single asset: deposit USDC from Arbitrum into Hyperliquid and approve a trading key.
       Theme: show the deposit address, wait for the credit, verify the trading approvals.
   strats run [--id name] [--dry-run] [--once] [--interval 30] [--no-report] [--force-side long|short|flat]
-      The loop. One line per cycle. --dry-run sends nothing. --no-report sends no totals to Quotient.
+      The loop. One line per cycle. --dry-run sends nothing. --no-report sends no report to Quotient.
       --force-side trades a made-up target for testing (single asset only); without --dry-run it also needs --yes-place-a-real-order.
       Refuses to start while the bot is deployed, unless --force.
   strats deploy [--id name] [--region blr1] [--size s-1vcpu-1gb] [--from-tarball] [--dry-run] [-y]
+      The deploy step of init, on its own, and the way to update a droplet.
       Put the runner on a DigitalOcean droplet in your own account, as a service that restarts.
       Shows the plan and the monthly cost and asks before creating anything. -y skips the question.
       --dry-run prints the plan and the first-boot script without calling DigitalOcean.
@@ -38,16 +45,18 @@ Usage
       Close what the bot holds, after a y/N confirm.
   strats config [show|accept] [--id name]
       Compare the server's settings with the pinned payout settings. accept re-pins them.
+  strats config publish-wallet [on|off] [--id name]
+      Show or change whether reports carry the wallet address, which lets the public project page show it. Off by default.
 
 Environment
   STRATS_PASSPHRASE     keystore passphrase, for unattended runs
   STRATS_HOME           data directory (default ~/.strats)
   STRATS_GATEWAY_URL    gateway base URL
   STRATS_API_KEY        API key for init
-  DIGITALOCEAN_TOKEN    DigitalOcean API token for deploy and destroy
+  DIGITALOCEAN_TOKEN    DigitalOcean API token for init, deploy and destroy
   STRATS_RUNTIME_CREDS  set by strats deploy on the droplet; run uses it instead of a keystore
 
-Exit codes: 0 done, 1 failed, 2 wrong usage.`;
+Exit codes: 0 done, 1 failed, 2 wrong usage, 130 stopped with Ctrl-C at a prompt or a wait.`;
 
 
 async function main(): Promise<number> {

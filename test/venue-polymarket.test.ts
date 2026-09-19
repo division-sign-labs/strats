@@ -76,6 +76,8 @@ describe("PolymarketVenue", () => {
     assert.equal(order.limitPrice, 0.505);
     assert.ok(order.size * order.limitPrice <= 50 + 1e-9);
     assert.ok(result.filledUsd > 0);
+    assert.equal(result.trade?.action, "buy");
+    assert.equal(result.trade?.sizeUsd, result.filledUsd);
   });
 
   it("does not buy when the wallet already holds the token, or when the holding cannot be confirmed", async () => {
@@ -99,6 +101,7 @@ describe("PolymarketVenue", () => {
     const result = await venue.buy(buyAction, market, snap);
     assert.equal(result.uncertain, true);
     assert.match(result.text, /Not resending/);
+    assert.equal(result.trade, undefined, "an order with an unknown result is not recorded as a trade");
   });
 
   it("sells no more than the wallet holds, at the bid or better", async () => {
@@ -125,8 +128,10 @@ describe("PolymarketVenue", () => {
     const fake: Fake = { orders: [], redeemed: [], balance: 0 };
     const venue = new PolymarketVenue(account, creds, {}, fakeAdapter(fake));
     const snap = await venue.snapshot([market], ["yes1"]);
-    assert.equal((await venue.redeem({ kind: "redeem", conditionId: "0xcond1", tokenId: "yes1", reason: "Resolved." }, market, snap)).ok, true);
+    const result = await venue.redeem({ kind: "redeem", conditionId: "0xcond1", tokenId: "yes1", reason: "Resolved." }, market, snap);
+    assert.equal(result.ok, true);
     assert.deepEqual(fake.redeemed, ["0xcond1"]);
+    assert.deepEqual([result.trade?.action, result.trade?.price], ["redeem", null]);
   });
 });
 

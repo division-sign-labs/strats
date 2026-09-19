@@ -89,6 +89,9 @@ describe("openPosition", () => {
 
     const target = calls[6]!.arg as OrderIntent;
     assert.deepEqual([target.side, target.tif, target.reduceOnly, target.size, target.limitPrice], ["SELL", "GTC", true, 0.0099, 102_000]);
+
+    // The acknowledged entry is described for the display-only trade list, from the position the venue shows.
+    assert.deepEqual(result.trade, { action: "open", sizeUsd: longPosition.size * longPosition.avgPrice, price: longPosition.avgPrice });
   });
 
   it("derives the same client id for the same signal revision, so a restart cannot double-enter", async () => {
@@ -143,6 +146,7 @@ describe("openPosition", () => {
     const result = await venue.openPosition(open, snapshot(), signal);
     assert.match(result.text, /did not fill/);
     assert.ok(!names(calls).includes("placePerpStop"));
+    assert.equal(result.trade, undefined, "an order that did not fill is not a trade");
   });
 
   it("still places the target and reports plainly when the stop fails", async () => {
@@ -174,6 +178,8 @@ describe("closePosition", () => {
     assert.deepEqual([close.side, close.tif, close.reduceOnly, close.size], ["SELL", "IOC", true, 0.0099]);
     assert.ok(close.limitPrice < 99_995 && close.limitPrice > 99_000);
     assert.ok(!names(calls).includes("cancelAll"));
+    assert.equal(result.trade?.action, "close");
+    assert.ok((result.trade?.sizeUsd ?? 0) > 0);
   });
 
   it("closes a position below the $10 entry minimum", async () => {
@@ -188,6 +194,7 @@ describe("closePosition", () => {
     const result = await venue.closePosition(snapshot({ position: longPosition, orders: [stopOrder, targetOrder] }));
     assert.equal(result.ok, false);
     assert.ok(!names(calls).includes("placeOrder"));
+    assert.equal(result.trade, undefined);
   });
 
   it("keeps the stop when the close only partly fills", async () => {

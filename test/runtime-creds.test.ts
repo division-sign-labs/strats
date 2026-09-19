@@ -58,6 +58,22 @@ describe("runtime credentials", () => {
     assert.ok(!JSON.stringify(doc).includes(PASSPHRASE));
   });
 
+  it("carry the choice to publish the wallet, so the droplet knows, and still nothing secret beyond the trading key", () => {
+    const bot = baseBot({ publishWallet: true, fundedAt: "2026-09-19T00:00:00.000Z" });
+    const doc = buildRuntimeCreds({ apiKey: API_KEY, gatewayUrl: bot.gatewayUrl, bot, hyperliquid: { agentPk: AGENT_PK, masterAddress: bot.masterAddress } });
+    const decoded = decodeRuntimeCreds(encodeRuntimeCreds(doc));
+    assert.equal(decoded.botState.publishWallet, true);
+    assert.equal(decodeRuntimeCreds(encodeRuntimeCreds(buildRuntimeCreds({ apiKey: API_KEY, gatewayUrl: bot.gatewayUrl, bot: baseBot(), hyperliquid: { agentPk: AGENT_PK, masterAddress: bot.masterAddress } }))).botState.publishWallet, undefined);
+
+    const wire = Buffer.from(encodeRuntimeCreds(doc), "base64url").toString("utf8");
+    assert.ok(!wire.includes(MASTER_PK), "master key");
+    assert.ok(!wire.includes(PASSPHRASE), "passphrase");
+    assert.ok(!/keystore|ciphertext|scrypt/i.test(wire), "keystore");
+    assert.deepEqual(Object.keys(doc).sort(), ["apiKey", "botState", "gatewayUrl", "hyperliquid"]);
+    // The only 32-byte secret on the wire is the trading key.
+    assert.deepEqual([...wire.matchAll(/0x[0-9a-fA-F]{64}/g)].map((m) => m[0]), [AGENT_PK]);
+  });
+
   it("refuse to build without the venue's trading credentials", () => {
     assert.throws(() => buildRuntimeCreds({ apiKey: API_KEY, gatewayUrl: "https://x.example", bot: baseBot() }), /strats fund/);
     assert.throws(() => buildRuntimeCreds({ apiKey: API_KEY, gatewayUrl: "https://x.example", bot: baseBot({ strategyId: "theme" }) }), /strats fund/);

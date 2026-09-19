@@ -103,8 +103,43 @@ export const ThemeTargetsSchema = z.object({
   closed: z.array(z.object({ conditionId: z.string().min(1), tokenId: z.string().min(1), reason: z.string() })).max(200),
 });
 
+/** The report body limit on the gateway, in bytes. A larger report is dropped here rather than sent. */
+export const REPORT_MAX_BYTES = 24 * 1024;
+export const REPORT_MAX_POSITIONS = 20;
+export const REPORT_MAX_TRADES = 30;
+export const REPORT_LABEL_MAX = 80;
+
+const reportLabel = z.string().min(1).max(REPORT_LABEL_MAX);
+/** `side` and `action` are shown as short tags: letters, digits, space, period, apostrophe and hyphen only. */
+const shortWord = z.string().regex(/^[A-Za-z0-9 .'-]{1,12}$/).refine((value) => value.trim() !== "", "blank");
+const usdAmount = z.number().finite().nonnegative();
+const nullableNumber = z.number().finite().nullable();
+
+/** One holding, in plain words. Display only. */
+export const ReportPositionSchema = z.strictObject({
+  /** What is held: the asset name, or the market question. */
+  label: reportLabel,
+  venue: z.enum(["hyperliquid", "polymarket"]),
+  /** "long", "short", or the outcome bought, such as "Yes". */
+  side: shortWord,
+  sizeUsd: usdAmount,
+  entryPrice: nullableNumber,
+  markPrice: nullableNumber,
+  pnlUsd: nullableNumber,
+});
+
+/** One action this runner took. Display only. */
+export const ReportTradeSchema = z.strictObject({
+  at: isoTime,
+  label: reportLabel,
+  /** "open", "close", "buy", "sell" or "redeem". */
+  action: shortWord,
+  sizeUsd: usdAmount,
+  price: nullableNumber,
+});
+
 /** The one document the runner sends up. Display only: the server never reads it to decide anything. */
-export const ReportSchema = z.object({
+export const ReportSchema = z.strictObject({
   v: z.literal(PROTOCOL_VERSION),
   at: isoTime,
   venue: z.enum(["hyperliquid", "polymarket"]),
@@ -115,6 +150,12 @@ export const ReportSchema = z.object({
   boughtBackUsd: z.number().finite().nonnegative(),
   openPositions: z.number().int().nonnegative(),
   lastAction: z.string().max(200),
+  /** What the bot holds. At most 20. */
+  positions: z.array(ReportPositionSchema).max(REPORT_MAX_POSITIONS).optional(),
+  /** The last actions this runner took, newest first. At most 30. */
+  trades: z.array(ReportTradeSchema).max(REPORT_MAX_TRADES).optional(),
+  /** Present only when the creator chose to publish the wallet. Absent by default. */
+  walletAddress: z.string().regex(/^0x[0-9a-fA-F]{40}$/).optional(),
 });
 
 export const TargetDocSchema = z.object({
@@ -125,6 +166,8 @@ export const TargetDocSchema = z.object({
   mode: z.enum(["open", "reduce-only"]),
   target: z.object({
     assetKey: z.string().min(1),
+    /** Display only, and optional: the asset's plain name when the server sends one. It never feeds a decision. */
+    name: z.string().max(80).optional().catch(undefined),
     coin: z.string().min(1),
     dex: z.string(),
     side: z.enum(["long", "short", "flat"]),
@@ -148,6 +191,8 @@ export type ThemeMarket = z.infer<typeof ThemeMarketSchema>;
 export type ThemeTarget = z.infer<typeof ThemeTargetSchema>;
 export type ThemeTargetsDoc = z.infer<typeof ThemeTargetsSchema>;
 export type Report = z.infer<typeof ReportSchema>;
+export type ReportPosition = z.infer<typeof ReportPositionSchema>;
+export type ReportTrade = z.infer<typeof ReportTradeSchema>;
 export type Profile = z.infer<typeof ProfileSchema>;
 export type TargetDoc = z.infer<typeof TargetDocSchema>;
 export type Target = TargetDoc["target"];
@@ -158,6 +203,16 @@ function describe(error: z.ZodError): string {
   if (!issue) return "invalid document";
   const path = issue.path.join(".");
   return path ? `${path}: ${issue.message}` : issue.message;
+}
+
+/** Check an outgoing report against the contract and the body limit. A report that fails either is dropped by the caller, never sent. */
+export function encodeReport(input: unknown): ParseResult<string> {
+  const parsed = ReportSchema.safeParse(input);
+  if (!parsed.success) return { ok: false, reason: `the report did not match the protocol (${describe(parsed.error)})` };
+  const body = JSON.stringify(parsed.data);
+  const bytes = Buffer.byteLength(body, "utf8");
+  if (bytes > REPORT_MAX_BYTES) return { ok: false, reason: `the report is ${bytes} bytes and the limit is ${REPORT_MAX_BYTES}` };
+  return { ok: true, value: body };
 }
 
 export function parseConfig(input: unknown): ParseResult<ConfigDoc> {

@@ -8,8 +8,8 @@ import { runLoop } from "../loop.js";
 import { appendLog } from "../paths.js";
 import type { ConfigDoc, TargetDoc } from "../protocol/index.js";
 import { describeDecision, holdReason, reconcile, type Decision, type ReconcileInput, type Side, type TargetInput } from "../reconcile.js";
-import { Reporter } from "../report.js";
-import { loadRuntimeState, saveRuntimeState } from "../runtime-state.js";
+import { Reporter, assetLabel, hyperliquidPositions, publishedWalletAddress, toReportTrade } from "../report.js";
+import { appendTrade, loadRuntimeState, saveRuntimeState } from "../runtime-state.js";
 import { loadAgentKey, openSession, scrub, sessionSecrets } from "../session.js";
 import type { Prompts } from "../setup.js";
 import { pinnedDifferences } from "../state.js";
@@ -100,6 +100,7 @@ export async function run(args: Args, prompts: Prompts): Promise<number> {
   const venues = new Map<string, Venue>();
   let lastVenue: Venue | undefined;
   let lastSnap: VenueSnapshot | undefined;
+  let lastLabel = "";
   let lastAction = "";
   const deployed = session.runtime !== undefined;
   const reporter = new Reporter(session.gateway, "stock-ls", bot.id, report && !dryRun);
@@ -145,6 +146,7 @@ export async function run(args: Args, prompts: Prompts): Promise<number> {
     const snap = await venue.snapshot();
     lastVenue = venue;
     lastSnap = snap;
+    lastLabel = assetLabel({ assetKey: target.doc.target.assetKey, name: target.doc.target.name, coin });
     if (forceSide !== undefined) {
       forced ??= forcedTarget(target.doc, forceSide, snap.market.quote.mid, now);
       // The forced levels are fixed for the life of the process; only its freshness moves.
@@ -164,9 +166,19 @@ export async function run(args: Args, prompts: Prompts): Promise<number> {
 
     const tag = forceSide !== undefined ? `${coin}  forced ${forceSide}  ` : `${coin}  `;
     if (dryRun || decision.kind === "hold" || decision.kind === "none") return `${tag}${describeDecision(decision, coin, dryRun)}`;
-    const acted = decision.kind === "open" ? (await venue.openPosition(decision, snap, target.doc.target)).text
-      : decision.kind === "close" ? `${(await venue.closePosition(snap)).text} ${decision.reason}`
-        : (await venue.repair(decision, snap)).text;
+    const result = decision.kind === "open" ? await venue.openPosition(decision, snap, target.doc.target)
+      : decision.kind === "close" ? await venue.closePosition(snap)
+        : await venue.repair(decision, snap);
+    if (result.trade) {
+      // Display only: the last trades this runner made, for the report. An acknowledged order also brings the next report forward.
+      const trade = toReportTrade({ at: Date.now(), label: lastLabel, ...result.trade });
+      if (trade) {
+        const state = loadRuntimeState(bot.id);
+        saveRuntimeState(bot.id, { ...state, trades: appendTrade(state.trades, trade) });
+      }
+      reporter.requestPrompt();
+    }
+    const acted = decision.kind === "close" ? `${result.text} ${decision.reason}` : result.text;
     lastAction = `${coin}: ${acted}`;
     return `${tag}${acted}`;
   };
@@ -188,7 +200,12 @@ export async function run(args: Args, prompts: Prompts): Promise<number> {
         const state = loadRuntimeState(bot.id);
         const volumeUsd = Math.max(state.volumeUsd, await lastVenue.volumeSince(since).catch(() => 0));
         if (volumeUsd !== state.volumeUsd) saveRuntimeState(bot.id, { ...loadRuntimeState(bot.id), volumeUsd });
-        return { venue: "hyperliquid", equityUsd: lastSnap.equityUsd, netDepositsUsd: deposits.amountUsd, volumeUsd, openPositions: lastSnap.position ? 1 : 0 };
+        return {
+          venue: "hyperliquid", equityUsd: lastSnap.equityUsd, netDepositsUsd: deposits.amountUsd, volumeUsd, openPositions: lastSnap.position ? 1 : 0,
+          positions: hyperliquidPositions(lastSnap.position, lastSnap.market.quote.mid, lastLabel),
+          trades: loadRuntimeState(bot.id).trades,
+          walletAddress: publishedWalletAddress(bot),
+        };
       });
       if (failure) emit(failure);
     },

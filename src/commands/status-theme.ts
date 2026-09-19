@@ -6,6 +6,7 @@ import { loadRuntimeState } from "../runtime-state.js";
 import { loadPolymarketCreds, type Session } from "../session.js";
 import { pinnedDifferences } from "../state.js";
 import { PolymarketVenue } from "../venue-polymarket.js";
+import { describePublication } from "./config.js";
 import { chainName } from "./init.js";
 import { row, showDeployment } from "./status.js";
 
@@ -15,10 +16,11 @@ export async function statusTheme(session: Session): Promise<number> {
   const now = Date.now();
 
   console.log(`Bot "${bot.id}" (your own theme, on Polymarket)`);
-  row("Deposit wallet", bot.polymarket?.funder ?? "not set up yet (run strats init --force)");
+  row("Deposit wallet", bot.polymarket?.funder ?? "not set up yet (run strats init)");
   row("Signing address", bot.masterAddress);
   row("API key", `${bot.keyPrefix}...`);
   row("Ceiling", `${bot.ceilingPct}% of the wallet per position`);
+  row("Project page", describePublication(bot));
 
   console.log("Settings");
   if (config.ok) {
@@ -52,7 +54,7 @@ export async function statusTheme(session: Session): Promise<number> {
 
   console.log("Polymarket");
   if (!bot.polymarket) {
-    row("Account", "not set up yet. Run: strats init --force");
+    row("Account", "not set up yet. Run: strats init");
     return 1;
   }
   const markets = config.ok ? config.value.config.strategy.markets : [];

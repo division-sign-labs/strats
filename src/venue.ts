@@ -55,10 +55,19 @@ export interface VenueSnapshot {
   market: PerpMarketSnapshot;
 }
 
+/** What an acknowledged order traded, for the display-only trade list. It feeds no decision. */
+export interface TradeFill {
+  action: "open" | "close";
+  sizeUsd: number;
+  price: number | null;
+}
+
 export interface ActionResult {
   /** False when the action did not complete. The next cycle re-reads the venue and converges either way. */
   ok: boolean;
   text: string;
+  /** Present when an order was acknowledged with a fill. */
+  trade?: TradeFill;
 }
 
 export interface SignalRef {
@@ -226,16 +235,18 @@ export class Venue {
       position = positions.find((p) => p.marketRef === this.coin && p.side === (long ? "LONG" : "SHORT") && p.size > 0);
     }
     if (!position) {
-      return (ack.filledSize ?? 0) > 0
-        ? { ok: false, text: "The entry filled but the position is not visible yet. The next cycle places the stop and target." }
+      const filled = ack.filledSize ?? 0;
+      return filled > 0
+        ? { ok: false, text: "The entry filled but the position is not visible yet. The next cycle places the stop and target.", trade: { action: "open", sizeUsd: filled * (ack.avgFillPrice ?? decision.limitPx), price: ack.avgFillPrice ?? null } }
         : { ok: true, text: `The entry order at up to ${px(decision.limitPx)} did not fill. The next cycle tries again if the price still allows it.` };
     }
 
     const stop = await this.placeStop(position, decision.stopPx);
     const target = await this.placeTarget(position, decision.targetPx);
     const opened = `Opened ${decision.side} ${position.size} ${this.coin} at ${px(position.avgPrice)}.`;
-    if (stop.ok && target.ok) return { ok: true, text: `${opened} Stop ${px(decision.stopPx)} and target ${px(decision.targetPx)} are placed.` };
-    return { ok: false, text: `${opened} ${stop.ok ? "" : `${stop.text} `}${target.ok ? "" : `${target.text} `}The next cycle retries.` };
+    const trade: TradeFill = { action: "open", sizeUsd: position.size * position.avgPrice, price: position.avgPrice };
+    if (stop.ok && target.ok) return { ok: true, text: `${opened} Stop ${px(decision.stopPx)} and target ${px(decision.targetPx)} are placed.`, trade };
+    return { ok: false, text: `${opened} ${stop.ok ? "" : `${stop.text} `}${target.ok ? "" : `${target.text} `}The next cycle retries.`, trade };
   }
 
   /**
@@ -267,8 +278,9 @@ export class Venue {
     });
     if (!capacity.ok) return { ok: false, text: `The close was not sent: ${capacity.skipReasons.join("; ")}. The stop stays in place.` };
 
+    let closeAck: OrderAck;
     try {
-      await this.adapter.placeOrder(this.acct, {
+      closeAck = await this.adapter.placeOrder(this.acct, {
         marketRef: this.coin, side: exitSide, size: capacity.size, limitPrice: capacity.limitPrice,
         tif: "IOC", postOnly: false, reduceOnly: true, purpose: "normal-exit", clientId: `strats:${this.coin}:close:${Date.now()}`,
       });
@@ -284,10 +296,13 @@ export class Venue {
       const positions = await this.adapter.positions(this.acct).catch(() => undefined);
       if (positions) remaining = positions.find((p) => p.marketRef === this.coin && p.size > 0);
     }
-    if (remaining) return { ok: false, text: `Closed part of the ${this.coin} position; ${remaining.size} remains and the stop stays in place. The next cycle continues.` };
+    const closedSize = Math.max(0, position.size - (remaining?.size ?? 0));
+    const closePx = closeAck.avgFillPrice ?? null;
+    const trade: TradeFill | undefined = closedSize > 0 ? { action: "close", sizeUsd: closedSize * (closePx ?? quote.mid), price: closePx } : undefined;
+    if (remaining) return { ok: false, text: `Closed part of the ${this.coin} position; ${remaining.size} remains and the stop stays in place. The next cycle continues.`, ...(trade ? { trade } : {}) };
 
     for (const order of stops) await this.adapter.cancelOrder(this.acct, order.id).catch(() => undefined);
-    return { ok: true, text: `Closed the ${this.coin} position of ${position.size}.` };
+    return { ok: true, text: `Closed the ${this.coin} position of ${position.size}.`, ...(trade ? { trade } : {}) };
   }
 
   /**

@@ -11,6 +11,8 @@ export const MIN_PASSPHRASE_LENGTH = 8;
 export class Prompts {
   private rl?: Interface;
   private muted = false;
+  /** Printed when Ctrl-C stops a command at a prompt or during a wait. A command sets it to say how to continue. */
+  interruptMessage = "Stopped.";
 
   get interactive(): boolean {
     return process.stdin.isTTY === true;
@@ -27,6 +29,14 @@ export class Prompts {
         },
       });
       this.rl = createInterface({ input: process.stdin, output, terminal: true });
+      // While a prompt is open the terminal hands Ctrl-C to readline, which would only pause input.
+      // Exit instead, so a long wait for a deposit can always be stopped and continued later.
+      this.rl.on("SIGINT", () => {
+        this.muted = false;
+        process.stdout.write("\n");
+        console.log(this.interruptMessage);
+        process.exit(130);
+      });
     }
     return this.rl;
   }
@@ -102,8 +112,10 @@ export function checkPassphrase(keystore: Keystore, botId: string, passphrase: s
 }
 
 /** The SetupContext handed to the adapter's funding flow. Secrets go to and from the encrypted keystore only. */
-export function makeSetupContext(botId: string, keystore: Keystore, passphrase: string, prompts: Prompts): SetupContext {
+export function makeSetupContext(botId: string, keystore: Keystore, passphrase: string, prompts: Prompts, opts: { skipDepositWait?: boolean } = {}): SetupContext {
   return {
+    // The funds are already there, so the flow goes straight to its checks instead of waiting for another deposit.
+    ...(opts.skipDepositWait ? { pollSkippable: async () => null } : {}),
     botId,
     ask: (question, opts) => prompts.ask(question, opts),
     confirm: (question, defaultYes) => prompts.confirm(question, defaultYes),

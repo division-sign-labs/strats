@@ -53,6 +53,8 @@ export interface PmActionResult {
   filledUsd: number;
   /** True when an order went out and its result is unknown. The caller must not send another for a while. */
   uncertain?: boolean;
+  /** Present when the order was acknowledged with a fill, or a redemption was accepted. Display only. */
+  trade?: { action: "buy" | "sell" | "redeem"; sizeUsd: number; price: number | null };
 }
 
 export function buildPolymarketAdapter(creds?: PolymarketCreds): PmAdapter {
@@ -211,7 +213,7 @@ export class PolymarketVenue {
       this.adapter.invalidateTokenBalance?.(action.tokenId);
       if (filled <= 0) return { ok: true, text: `The buy of ${action.outcome} at up to ${limitPrice} did not fill. The next cycle tries again if the price still allows it.`, filledUsd: 0 };
       const paid = ack.avgFillPrice ?? limitPrice;
-      return { ok: true, text: `Bought ${filled} "${action.outcome}" at ${paid.toFixed(3)} ($${(filled * paid).toFixed(2)}). ${action.question}`, filledUsd: filled * paid };
+      return { ok: true, text: `Bought ${filled} "${action.outcome}" at ${paid.toFixed(3)} ($${(filled * paid).toFixed(2)}). ${action.question}`, filledUsd: filled * paid, trade: { action: "buy", sizeUsd: filled * paid, price: paid } };
     } catch (error) {
       if (error instanceof PolymarketOrderRejectedError) return { ok: false, text: `Polymarket rejected the buy of ${action.outcome}: ${error.message}. Nothing was bought.`, filledUsd: 0 };
       if (/below the current Polymarket minimum|rounds to zero|does not belong|does not match|identity changed/.test(message(error))) {
@@ -243,7 +245,7 @@ export class PolymarketVenue {
       this.adapter.invalidateTokenBalance?.(action.tokenId);
       if (filled <= 0) return { ok: true, text: `The sell of ${size} at ${action.minPrice} did not fill. The next cycle tries again.`, filledUsd: 0 };
       const got = ack.avgFillPrice ?? action.minPrice;
-      return { ok: true, text: `Sold ${filled} at ${got.toFixed(3)} ($${(filled * got).toFixed(2)}, ${action.why}). ${action.reason}`, filledUsd: filled * got };
+      return { ok: true, text: `Sold ${filled} at ${got.toFixed(3)} ($${(filled * got).toFixed(2)}, ${action.why}). ${action.reason}`, filledUsd: filled * got, trade: { action: "sell", sizeUsd: filled * got, price: got } };
     } catch (error) {
       if (error instanceof PolymarketOrderRejectedError) return { ok: false, text: `Polymarket rejected the sell: ${error.message}.`, filledUsd: 0 };
       return { ok: false, text: `The sell may or may not have reached Polymarket (${message(error)}). It can only reduce the position. The next cycle reads the wallet again.`, filledUsd: 0 };
@@ -259,7 +261,7 @@ export class PolymarketVenue {
     try {
       const identity = orderIdentity(market, action.tokenId);
       const receipt = await this.adapter.redeem(this.acct, { marketRef: identity.marketRef, tokenId: action.tokenId, conditionId: action.conditionId, outcome: identity.outcome, side: identity.outcome, size: holding.size, avgPrice: holding.avgPrice, redeemable: true });
-      return { ok: true, text: `Redeemed the resolved market ${action.conditionId.slice(0, 10)}...${receipt?.transactionHash ? ` (transaction ${receipt.transactionHash})` : ""}.`, filledUsd: 0 };
+      return { ok: true, text: `Redeemed the resolved market ${action.conditionId.slice(0, 10)}...${receipt?.transactionHash ? ` (transaction ${receipt.transactionHash})` : ""}.`, filledUsd: 0, trade: { action: "redeem", sizeUsd: holding.valueUsd, price: null } };
     } catch (error) {
       return { ok: false, uncertain: true, text: `The redemption may or may not have been accepted (${message(error)}). It is not sent again; check the wallet on Polymarket.`, filledUsd: 0 };
     }

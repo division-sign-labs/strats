@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { ReportSchema, parseConfig, parseThemeConfig, parseThemeTargets } from "../src/protocol/index.js";
+import { ReportPositionSchema, ReportSchema, ReportTradeSchema, parseConfig, parseThemeConfig, parseThemeTargets } from "../src/protocol/index.js";
 
 const account = { positionPct: 10, token: { chainId: 8453, address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" }, split: { buybackPct: 70, keepPct: 30 } };
 const marketDoc = { conditionId: "0xabc", tokenIds: ["111", "222"], outcomes: ["Yes", "No"], side: 0, question: "Will it happen?", marketKey: null };
@@ -101,7 +101,12 @@ describe("theme targets", () => {
 });
 
 describe("report", () => {
-  it("has exactly the agreed fields and no room for an address", () => {
-    assert.deepEqual(Object.keys(ReportSchema.shape).sort(), ["at", "boughtBackUsd", "equityUsd", "lastAction", "netDepositsUsd", "openPositions", "profitUsd", "v", "venue", "volumeUsd"]);
+  it("has exactly the agreed fields, the three newer ones optional, and refuses anything else", () => {
+    assert.deepEqual(Object.keys(ReportSchema.shape).sort(), ["at", "boughtBackUsd", "equityUsd", "lastAction", "netDepositsUsd", "openPositions", "positions", "profitUsd", "trades", "v", "venue", "volumeUsd", "walletAddress"]);
+    const totals = { v: 1, at: "2026-09-19T12:00:00.000Z", venue: "polymarket", equityUsd: 1, netDepositsUsd: 1, profitUsd: 0, volumeUsd: 0, boughtBackUsd: 0, openPositions: 0, lastAction: "" };
+    assert.equal(ReportSchema.safeParse(totals).success, true, "a report without positions, trades or an address is complete");
+    assert.equal(ReportSchema.safeParse({ ...totals, signerPk: "x" }).success, false);
+    assert.deepEqual(Object.keys(ReportPositionSchema.shape).sort(), ["entryPrice", "label", "markPrice", "pnlUsd", "side", "sizeUsd", "venue"]);
+    assert.deepEqual(Object.keys(ReportTradeSchema.shape).sort(), ["action", "at", "label", "price", "sizeUsd"]);
   });
 });

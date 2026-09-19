@@ -2,7 +2,7 @@
 // up is the display-only report. Never throws: every failure comes back as a
 // typed result so the run loop can hold instead of crashing.
 import {
-  ReportSchema, STRATEGY_ID, THEME_STRATEGY_ID, parseConfig, parseTarget, parseThemeConfig, parseThemeTargets,
+  STRATEGY_ID, encodeReport, THEME_STRATEGY_ID, parseConfig, parseTarget, parseThemeConfig, parseThemeTargets,
   type AnyConfigDoc, type ConfigDoc, type ParseResult, type Report, type StrategyId, type TargetDoc, type ThemeConfigDoc, type ThemeTargetsDoc,
 } from "./protocol/index.js";
 
@@ -116,20 +116,21 @@ export async function discoverConfig(opts: GatewayOptions): Promise<FetchResult<
 /**
  * Send the display-only report. One attempt, short timeout, never throws. The
  * answer is not read beyond its status, and nothing the server says here can
- * change what the runner does.
+ * change what the runner does. A report that does not match the contract, or
+ * is larger than the gateway accepts, is dropped here and never sent.
  */
-export async function postReport(opts: GatewayOptions, strategyId: StrategyId, report: Report): Promise<{ ok: true } | { ok: false; message: string }> {
-  const body = ReportSchema.safeParse(report);
-  if (!body.success) return { ok: false, message: "the report did not match the protocol" };
+export async function postReport(opts: GatewayOptions, strategyId: StrategyId, report: Report): Promise<{ ok: true } | { ok: false; message: string; status?: number; dropped?: true }> {
+  const body = encodeReport(report);
+  if (!body.ok) return { ok: false, dropped: true, message: body.reason };
   try {
     const response = await (opts.fetchImpl ?? fetch)(`${opts.gatewayUrl}/api/v1/strategies/${strategyId}/reports`, {
       method: "POST",
       headers: { "x-quotient-api-key": opts.apiKey, "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify(body.data),
+      body: body.value,
       signal: AbortSignal.timeout(TIMEOUT_MS),
       redirect: "error",
     });
-    return response.status >= 200 && response.status < 300 ? { ok: true } : { ok: false, message: `the gateway answered ${response.status}` };
+    return response.status >= 200 && response.status < 300 ? { ok: true } : { ok: false, status: response.status, message: `the gateway answered ${response.status}` };
   } catch (error) {
     return { ok: false, message: error instanceof Error && error.name === "TimeoutError" ? "request timed out" : "network error" };
   }

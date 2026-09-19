@@ -71,7 +71,7 @@ export function loadAgentKey(session: Session): string {
  */
 export function loadPolymarketCreds(session: Session): PolymarketCreds {
   const { bot } = session;
-  if (!bot.polymarket) throw new Error("This bot has no Polymarket account yet. Run: strats init --force");
+  if (!bot.polymarket) throw new Error("This bot has no Polymarket account yet. Run: strats init");
   if (session.runtime) {
     if (!session.runtime.polymarket) throw new Error("The runtime credentials carry no Polymarket account. Run strats deploy again.");
     return session.runtime.polymarket;

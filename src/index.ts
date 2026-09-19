@@ -9,7 +9,8 @@ export {
   THEME_HARD_CAP_PCT, THEME_MAX_BUYS_PER_CYCLE, describeThemeDecision, reconcileTheme, themeEffectivePct, themeHoldReason,
   type ThemeAction, type ThemeDecision, type ThemeHolding, type ThemeQuote, type ThemeReconcileInput, type ThemeTargetsInput,
 } from "./reconcile-theme.js";
-export { buildReport, sanitizeAction, type ReportFigures } from "./report.js";
+export { nextInitStage, isFunded, type InitFacts, type InitStage } from "./install.js";
+export { buildReport, sanitizeAction, sanitizeLabel, type ReportFigures } from "./report.js";
 export {
   ENTRY_SLIPPAGE_PCT, HARD_CAP_PCT, VENUE_MIN_NOTIONAL_USD,
   describeDecision, effectivePct, floorToDecimals, holdReason, reconcile, venuePrice,

@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { parseArgs } from "../src/args.js";
-import { READY_MARKER, installRunnerCommand, installTarballCommand, renderCloudInit, renderUnit } from "../src/deploy/cloud-init.js";
+import { DEFAULT_REGION, READY_MARKER, installRunnerCommand, installTarballCommand, renderCloudInit, renderUnit } from "../src/deploy/cloud-init.js";
 import { remoteWriteCommand } from "../src/deploy/remote-write.js";
 import { restrictedChildEnv } from "../src/deploy/ssh.js";
-import { disclosure, monthlyCost } from "../src/commands/deploy.js";
+import { disclosure, monthlyCost, regionLabel, watchLines } from "../src/commands/deploy.js";
 import type { BotState } from "../src/state.js";
 
 /** Anything shaped like a key, a token or a credential assignment. */
@@ -70,6 +70,22 @@ describe("deploy", () => {
     const theme = disclosure({ ...bot, strategyId: "theme" }).join(" ");
     assert.match(theme, /Polymarket wallet key/);
     assert.match(theme, /Whoever controls the droplet controls the funds/);
+    // The choice about the wallet travels in the settings file, and the plan says which way it is set.
+    assert.match(disclosure(bot).join(" "), /publishing the wallet \(not published\)/);
+    assert.match(disclosure({ ...bot, publishWallet: true }).join(" "), /publishing the wallet \(published\)/);
+  });
+
+  it("names Bangalore, the default region, in plain words, and says how to watch a deployed bot", () => {
+    assert.equal(DEFAULT_REGION, "blr1");
+    assert.equal(regionLabel(DEFAULT_REGION), "blr1 (Bangalore)");
+    assert.equal(regionLabel("xyz9"), "xyz9");
+    const lines = watchLines(bot).join("\n");
+    assert.match(lines, /strats status/);
+    assert.match(lines, /strats logs/);
+    assert.match(lines, /https:\/\/tokenstrats\.xyz\/projects/);
+    assert.match(lines, /wallet address is not published/);
+    assert.match(watchLines({ ...bot, publishWallet: true }).join("\n"), /is published with each report, as you chose/);
+    assert.ok(!lines.includes(bot.masterAddress));
   });
 
   it("prints the monthly cost of a known size", () => {

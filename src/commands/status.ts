@@ -7,6 +7,7 @@ import { openSession } from "../session.js";
 import type { Prompts } from "../setup.js";
 import { pinnedDifferences, type BotState } from "../state.js";
 import { Venue, toOrderView } from "../venue.js";
+import { describePublication } from "./config.js";
 import { chainName } from "./init.js";
 import { openBlocked, toReconcileInput } from "./run.js";
 
@@ -45,6 +46,7 @@ export async function status(args: Args, prompts: Prompts): Promise<number> {
   row("Trading key", bot.agentAddress ?? "not approved yet (run strats fund)");
   row("API key", `${bot.keyPrefix}...`);
   row("Ceiling", `${bot.ceilingPct}% of the wallet per position`);
+  row("Project page", describePublication(bot));
 
   console.log("Settings");
   if (config.ok) {

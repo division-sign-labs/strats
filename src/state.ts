@@ -19,6 +19,8 @@ export const DeploymentSchema = z.object({
   size: z.string().min(1),
   version: z.string().min(1),
   deployedAt: z.string(),
+  /** True from the moment the droplet exists until its runner is confirmed active. A deploy that was stopped in between is finished by running it again. */
+  pending: z.boolean().optional(),
 });
 export type Deployment = z.infer<typeof DeploymentSchema>;
 
@@ -35,6 +37,13 @@ export const BotStateSchema = z.object({
   /** Theme bots: the Polymarket account. masterAddress is its signer; funder is the deposit wallet that holds the funds. */
   polymarket: z.object({ signerAddress: address, funder: address, signatureType: z.number().int() }).optional(),
   deployment: DeploymentSchema.optional(),
+  /** When strats fund last finished. Bots funded before 0.3.0 have no field. */
+  fundedAt: z.string().optional(),
+  /**
+   * True only when the creator chose to show this bot's wallet on its public project page.
+   * Then, and only then, a report carries the wallet address. Not a secret. Bots created before 0.3.0 have no field, which means false.
+   */
+  publishWallet: z.boolean().optional(),
   ceilingPct: z.number().positive().max(MAX_POSITION_PCT),
   pinned: z.object({ token: TokenSchema, split: SplitSchema }),
   createdAt: z.string(),
