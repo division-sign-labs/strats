@@ -35,6 +35,8 @@ export const payoutsSummaryFile = (id: string): string => join(stateDir(), `${as
 export const buybackJournalFile = (id: string): string => join(stateDir(), `${assertBotId(id)}.buyback.json`);
 
 /** A droplet that buys back by itself only: the payout record and deposits figure strats deploy sent it. No secret. */
+/** When the droplet's automatic buyback last checked the profit, so a restart does not bring a second check the same day. */
+export const buybackCheckFile = (id: string): string => join(stateDir(), `${assertBotId(id)}.buyback-check.json`);
 export const buybackBasisFile = (id: string): string => join(stateDir(), `${assertBotId(id)}.buyback-basis.json`);
 
 /** mkdir honors the umask and ignores existing directories, so set the mode explicitly. */

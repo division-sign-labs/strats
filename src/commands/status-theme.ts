@@ -1,6 +1,6 @@
 // strats status for a theme or team bot, and for the Polymarket side of a single-asset bot. Read-only: the venue it builds refuses every order.
 import { describeAutoBuyback } from "../buyback/text.js";
-import { ASSET_SOURCE, sourceFor } from "../polymarket-source.js";
+import { ASSET_SOURCE, sourceFor, type PolymarketSource } from "../polymarket-source.js";
 import { TEAM_BET_MODES, type ConfigDoc } from "../protocol/index.js";
 import { usd } from "../reconcile.js";
 import { describeThemeDecision, reconcileTheme, themeEffectivePct } from "../reconcile-theme.js";
@@ -12,6 +12,7 @@ import { gameCounts } from "../team-markets.js";
 import { PolymarketVenue } from "../venue-polymarket.js";
 import { describePublication } from "./config.js";
 import { chainName } from "./init.js";
+import { readCycle } from "./run-theme.js";
 import { payoutNote, row, showDeployment } from "./status.js";
 
 export async function statusTheme(session: Session): Promise<number> {
@@ -43,7 +44,7 @@ export async function statusTheme(session: Session): Promise<number> {
     } else if (config.value.config.strategyId === "theme") {
       const { strategy } = config.value.config;
       row("Thesis", strategy.thesis);
-      row("Markets", `${strategy.markets.length} configured`);
+      row("Markets", strategy.markets ? `${strategy.markets.length} configured` : "chosen by Q: the bot adds and drops them itself");
     }
     row("Position size", `${account.positionPct}% configured, ${themeEffectivePct(account.positionPct, bot.ceilingPct)}% in force`);
   } else {
@@ -81,11 +82,12 @@ export async function statusTheme(session: Session): Promise<number> {
     return 1;
   }
   // Without the targets a team bot has no games to look in; a theme bot still has the markets from its settings.
-  const allowed = targets.ok ? source.marketsFor(config.ok ? config.value : undefined, targets.value) : undefined;
-  const markets = allowed?.markets ?? (config.ok && config.value.config.strategyId === "theme" ? config.value.config.strategy.markets : []);
-  for (const note of allowed?.refused ?? []) row("Refused", note);
   const venue = new PolymarketVenue(bot.polymarket, loadPolymarketCreds(session), { readOnly: true });
-  const snap = await venue.snapshot(markets, allowed?.quoteTokenIds ?? []);
+  const read = targets.ok ? await readCycle(source, config.ok ? config.value : undefined, targets.value, venue) : undefined;
+  const allowed = read?.allowed;
+  const markets = allowed?.markets ?? (config.ok && config.value.config.strategyId === "theme" ? config.value.config.strategy.markets ?? [] : []);
+  for (const note of read?.refused ?? []) row("Refused", note);
+  const snap = read?.snap ?? (await venue.snapshot(markets, []));
   row("Equity", `${usd(snap.equityUsd)}: ${usd(snap.collateralUsd)} free, ${usd(snap.exposureUsd)} in positions`);
   const configured = new Set(markets.flatMap((m) => m.tokenIds));
   for (const h of snap.holdings) {
@@ -134,26 +136,28 @@ export async function statusMarkets(session: Session, config: ConfigDoc | undefi
   const now = Date.now();
 
   console.log("Market targets");
-  const allowed = targets.ok ? ASSET_SOURCE.marketsFor(config, targets.value) : undefined;
+  // The wallet is read with the targets, because a managed key's markets are confirmed on Polymarket before anything is shown.
+  const venue = bot.polymarket ? new PolymarketVenue(bot.polymarket, loadPolymarketCreds(session), { readOnly: true }) : undefined;
+  const read = targets.ok && venue ? await readCycle(ASSET_SOURCE as PolymarketSource, config, targets.value, venue) : undefined;
+  const allowed = read?.allowed ?? (targets.ok ? ASSET_SOURCE.marketsFor(config, targets.value) : undefined);
   if (targets.ok && allowed) {
     row("Mode", targets.value.mode);
     row("Fresh", now <= Date.parse(targets.value.validUntil) ? `yes, valid until ${targets.value.validUntil}` : `no, expired at ${targets.value.validUntil}`);
     row("To hold", `${allowed.doc.targets.length} market${allowed.doc.targets.length === 1 ? "" : "s"}`);
     for (const t of allowed.doc.targets.slice(0, 40)) console.log(`    ${t.outcome} at up to ${t.maxPrice}${t.q !== null ? `, Q ${t.q}` : ""}: ${t.question}`);
     row("Closed", `${targets.value.closed.length} market${targets.value.closed.length === 1 ? "" : "s"}`);
-    for (const note of allowed.refused) row("Refused", note);
+    for (const note of read?.refused ?? allowed.refused) row("Refused", note);
   } else if (!targets.ok) {
     row("Targets", `not available. ${targets.message} The markets hold in this state. The perp is not affected.`);
   }
 
   console.log("Polymarket");
-  if (!bot.polymarket) {
+  if (!bot.polymarket || !venue) {
     row("Account", "not set up yet. Run: strats init");
     return;
   }
   const markets = allowed?.markets ?? config?.config.strategy.markets ?? [];
-  const venue = new PolymarketVenue(bot.polymarket, loadPolymarketCreds(session), { readOnly: true });
-  const snap = await venue.snapshot(markets, allowed?.quoteTokenIds ?? []);
+  const snap = read?.snap ?? (await venue.snapshot(markets, allowed?.quoteTokenIds ?? []));
   row("Equity", `${usd(snap.equityUsd)}: ${usd(snap.collateralUsd)} free, ${usd(snap.exposureUsd)} in positions`);
   const configured = new Set(markets.flatMap((m) => m.tokenIds));
   for (const h of snap.holdings) {
@@ -170,6 +174,7 @@ export async function statusMarkets(session: Session, config: ConfigDoc | undefi
     collateralUsd: snap.collateralUsd, equityUsd: snap.equityUsd, exposureUsd: snap.exposureUsd,
     positionPct: config?.config.account.positionPct ?? 0, ceilingPct: bot.ceilingPct,
     blockedTargetIds: Object.keys(state.entered), redeemedConditionIds: Object.keys(state.redeemed), pendingTokenIds: snap.pendingTokenIds,
+    ...(ASSET_SOURCE.entryRule ? { entryRule: ASSET_SOURCE.entryRule } : {}),
     ...(config ? {} : { openBlockedReason: "The settings could not be loaded. Not opening." }),
   });
   console.log(`  ${describeThemeDecision(decision, true)}`);

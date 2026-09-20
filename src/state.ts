@@ -62,6 +62,11 @@ export const BotStateSchema = z.object({
    * the droplet what a buyback needs to withdraw and swap. Not a secret. Bots created before 0.5.0 have no field, which means false.
    */
   autoBuyback: z.boolean().optional(),
+  /**
+   * Set when a droplet that bought back by itself was replaced or destroyed with --force, without its payout record. This machine's
+   * record may then be missing what that droplet paid, so nothing is paid unattended until a person turns auto-buyback on again.
+   */
+  payoutRecordIncomplete: z.object({ at: z.string() }).optional(),
   ceilingPct: z.number().positive().max(MAX_POSITION_PCT),
   /**
    * Where a payout goes. `destination` is set only by strats buyback --to; without it the bought token goes to this bot's own wallet.
@@ -82,8 +87,21 @@ export const isTwoVenueBot = (bot: Pick<BotState, "strategyId" | "markets">): bo
 /** A two-venue bot keeps its Polymarket counters in a file of their own, because both loops run in one process. */
 export const marketsStateScope = (bot: Pick<BotState, "strategyId" | "markets">): "markets" | undefined => (isTwoVenueBot(bot) ? "markets" : undefined);
 
+/**
+ * Whether the unattended buyback may run for this bot at all. A theme or team bot measures profit from a deposits figure recorded on
+ * the creator's machine, and Polymarket has no deposit history to check it against: money added any other way would be paid out as
+ * profit with nobody asked. So only a bot whose profit comes from Hyperliquid's own history may buy back unattended.
+ */
+export const autoBuybackAvailable = (bot: Pick<BotState, "strategyId">): boolean => !isPolymarketBot(bot);
+
+/** The bot after a droplet's payout record was given up with --force: auto-buyback is off, and the gap is remembered. */
+export function withoutDropletRecord(bot: BotState, at: string): BotState {
+  const { autoBuyback: _autoBuyback, ...rest } = bot;
+  return { ...rest, autoBuyback: false, payoutRecordIncomplete: { at } };
+}
+
 /** True when strats deploy sends the wallet's master key: auto-buyback is on and the money is on Hyperliquid. A theme or team bot's droplet already holds its wallet key. */
-export const sendsMasterKey = (bot: Pick<BotState, "autoBuyback" | "strategyId">): boolean => bot.autoBuyback === true && !isPolymarketBot(bot);
+export const sendsMasterKey = (bot: Pick<BotState, "autoBuyback" | "strategyId">): boolean => bot.autoBuyback === true && autoBuybackAvailable(bot);
 
 /** The droplet may be paying out: it was deployed with auto-buyback on, or the setting is on and a deploy is what sends it. */
 export const dropletBuysBack = (bot: Pick<BotState, "autoBuyback" | "deployment">): boolean => bot.deployment !== undefined && (bot.autoBuyback === true || bot.deployment.autoBuyback === true);

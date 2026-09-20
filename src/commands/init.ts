@@ -7,16 +7,16 @@
 // strats fund and strats deploy run.
 import { KeyRoles, generateEoa } from "@quotient-forecasting/cassie-core";
 import { UsageError, type Args } from "../args.js";
-import { autoBuybackQuestion } from "../buyback/text.js";
+import { AUTO_BUYBACK_UNAVAILABLE, autoBuybackQuestion } from "../buyback/text.js";
 import { DEFAULT_GATEWAY_URL, discoverConfig, fetchConfigFor, normalizeGatewayUrl } from "../client.js";
 import { STAGE_NAMES, nextInitStage, type InitStage } from "../install.js";
 import { DEFAULT_BOT_ID, assertBotId, ensureHome, keysDir } from "../paths.js";
-import { TEAM_BET_MODES, configuredMarkets, type AnyConfigDoc } from "../protocol/index.js";
+import { TEAM_BET_MODES, tradesMarkets, type AnyConfigDoc } from "../protocol/index.js";
 import { VENUE_MIN_NOTIONAL_USD, effectivePct } from "../reconcile.js";
 import { THEME_DEFAULT_MIN_SHARES } from "../reconcile-theme.js";
 import { POLYMARKET_L2_ROLE, POLYMARKET_SIGNER_ROLE, openSession, polymarketSignerRole, requireKeystore, type KeystoreSession } from "../session.js";
 import { checkPassphrase, makeSetupContext, openKeystore, readPassphrase, type Prompts } from "../setup.js";
-import { API_KEY_ROLE, MAX_POSITION_PCT, botExists, isPolymarketBot, isTwoVenueBot, loadBot, saveBot, type BotState } from "../state.js";
+import { API_KEY_ROLE, MAX_POSITION_PCT, autoBuybackAvailable, botExists, isPolymarketBot, isTwoVenueBot, loadBot, saveBot, type BotState } from "../state.js";
 import { buildAdapter } from "../venue.js";
 import { buildPolymarketAdapter } from "../venue-polymarket.js";
 import { PROJECTS_URL, deployBot, watchLines } from "./deploy.js";
@@ -41,14 +41,15 @@ function describeStrategy(config: AnyConfigDoc["config"]): string[] {
     return [
       "  Strategy         Your own theme, on Polymarket",
       `  Thesis           ${config.strategy.thesis}`,
-      `  Markets          ${config.strategy.markets.length} chosen on TokenStrats`,
+      `  Markets          ${config.strategy.markets ? `${config.strategy.markets.length} chosen on TokenStrats` : "chosen by Q: the bot adds and drops them itself"}`,
     ];
   }
   const markets = config.strategy.markets?.length ?? 0;
+  const managed = config.strategy.universe === "managed";
   return [
-    `  Strategy         Single asset, on Hyperliquid${markets > 0 ? " and Polymarket" : ""}`,
+    `  Strategy         Single asset, on Hyperliquid${markets > 0 || managed ? " and Polymarket" : ""}`,
     `  Asset            ${config.strategy.assetKey}`,
-    ...(markets > 0 ? [`  Markets          ${markets} on Polymarket, chosen on TokenStrats`] : []),
+    ...(managed ? ["  Markets          on Polymarket, chosen by Q: the bot adds and drops them itself"] : markets > 0 ? [`  Markets          ${markets} on Polymarket, chosen on TokenStrats`] : []),
   ];
 }
 
@@ -109,11 +110,18 @@ async function setup(args: Args, prompts: Prompts, id: string, gatewayUrl: strin
     : prompts.interactive && (await prompts.confirm("Show this bot's trades on its public project page? The wallet address becomes public.", false));
   // Asked once too, on a terminal only, and not when --no-deploy says there is no droplet. No flag answers it, and the default is no.
   // Yes is the consent the droplet's unattended buyback runs on. strats config auto-buyback changes it.
-  const autoBuyback = earlier?.autoBuyback !== undefined
-    ? earlier.autoBuyback
-    : prompts.interactive && !args.flags.has("no-deploy")
-      ? await prompts.confirm(autoBuybackQuestion({ strategyId: config.value.config.strategyId }), false)
-      : undefined;
+  // An earlier answer counts only for the same wallet and strategy: it was given to the question that bot was asked.
+  // A theme or team bot is never asked: its profit is measured from a deposits figure kept here, which a droplet cannot check.
+  const sameBot = earlier !== undefined && earlier.strategyId === config.value.config.strategyId && keystore.exists(id) && keystore.entryMeta(id, KeyRoles.master)?.address !== undefined;
+  const offered = autoBuybackAvailable({ strategyId: config.value.config.strategyId });
+  if (!offered) console.log(AUTO_BUYBACK_UNAVAILABLE);
+  const autoBuyback = !offered
+    ? (earlier?.autoBuyback !== undefined ? false : undefined)
+    : sameBot && earlier?.autoBuyback !== undefined
+      ? earlier.autoBuyback
+      : prompts.interactive && !args.flags.has("no-deploy")
+        ? await prompts.confirm(autoBuybackQuestion({ strategyId: config.value.config.strategyId }), false)
+        : undefined;
 
   const keystoreExists = keystore.exists(id);
   const passphrase = await readPassphrase(prompts, { create: !keystoreExists });
@@ -136,8 +144,8 @@ async function setup(args: Args, prompts: Prompts, id: string, gatewayUrl: strin
   }
   // A single asset with Polymarket markets is still one bot. Its Polymarket orders are signed by a key of their own,
   // so the droplet, which must hold that key, never holds the key that owns the Hyperliquid funds.
-  const tradesMarkets = config.value.strategyId === "stock-ls" && configuredMarkets(config.value).length > 0;
-  const markets = tradesMarkets ? previous?.markets ?? {} : previous?.markets;
+  const twoVenues = config.value.strategyId === "stock-ls" && tradesMarkets(config.value);
+  const markets = twoVenues ? previous?.markets ?? {} : previous?.markets;
   let polymarketSigner = keystore.entryMeta(id, POLYMARKET_SIGNER_ROLE)?.address;
   if (markets && !polymarketSigner) {
     const signer = generateEoa();
@@ -158,6 +166,7 @@ async function setup(args: Args, prompts: Prompts, id: string, gatewayUrl: strin
     ...(previous?.fundedAt ? { fundedAt: previous.fundedAt } : {}),
     publishWallet,
     ...(autoBuyback !== undefined ? { autoBuyback } : {}),
+    ...(previous?.payoutRecordIncomplete ? { payoutRecordIncomplete: previous.payoutRecordIncomplete } : {}),
     ceilingPct,
     // A destination pinned with strats buyback --to is this machine's choice, so reading the settings again keeps it.
     pinned: { token: account.token, split: account.split, ...(previous?.pinned.destination ? { destination: previous.pinned.destination } : {}) },

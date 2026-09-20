@@ -13,7 +13,8 @@ import {
   DEFAULT_REGION, DEFAULT_SIZE, DROPLET_IMAGE, READY_MARKER, RUNNER_PACKAGE, SIZE_MONTHLY_USD, UNIT_PATH,
   envPath, installRunnerCommand, installTarballCommand, renderCloudInit, renderUnit,
 } from "../deploy/cloud-init.js";
-import { ensureDigitalOceanReady, publicIpv4, type Droplet } from "../deploy/digitalocean.js";
+import { AUTO_BUYBACK_UNAVAILABLE } from "../buyback/text.js";
+import { DigitalOceanError, ensureDigitalOceanReady, publicIpv4, type Droplet } from "../deploy/digitalocean.js";
 import { remoteWriteCommand } from "../deploy/remote-write.js";
 import { ensureKeypair, forgetHostKey, pinHostKey, restrictedChildEnv, scpTo, sshExec, sshExecOrThrow, type Target } from "../deploy/ssh.js";
 import { pullRecord, pushBasis } from "../buyback/droplet.js";
@@ -23,7 +24,7 @@ import { pushPayoutSummary } from "../payouts.js";
 import { RUNTIME_CREDS_ENV, buildRuntimeCreds, encodeRuntimeCreds, type RuntimeCredsDoc } from "../runtime-creds.js";
 import { loadAgentKey, loadPolymarketCreds, loadWalletKey, openSession, requireKeystore, runtimeCredsPresent, type KeystoreSession } from "../session.js";
 import type { Prompts } from "../setup.js";
-import { isPolymarketBot, isTwoVenueBot, loadBot, resolveBotId, saveBot, sendsMasterKey, type BotState } from "../state.js";
+import { autoBuybackAvailable, isPolymarketBot, isTwoVenueBot, loadBot, resolveBotId, saveBot, sendsMasterKey, withoutDropletRecord, type BotState } from "../state.js";
 import { packageRoot, packageVersion } from "../version.js";
 
 /** Polymarket refuses orders from the United States, so a bot that trades there is never placed there. */
@@ -186,12 +187,22 @@ export function runtimeCredsFor(session: KeystoreSession, bot: BotState = sessio
     buybackMasterPk = loadWalletKey(session) ?? undefined;
     if (!buybackMasterPk) throw new Error("Auto-buyback is on, and the keystore has no wallet key to send.");
   }
+  // A two-venue bot's Polymarket arm is optional: without it the droplet runs the perp only. A theme or team bot cannot run without it.
+  let polymarket: ReturnType<typeof loadPolymarketCreds> | undefined;
+  if (isPolymarketBot(bot)) polymarket = loadPolymarketCreds(session);
+  else if (isTwoVenueBot(bot)) {
+    try {
+      polymarket = loadPolymarketCreds(session);
+    } catch (error) {
+      console.log(`The Polymarket credentials could not be read (${error instanceof Error ? error.message.slice(0, 160) : "unknown error"}). The droplet will run the perp only. To fix: strats init`);
+    }
+  }
   return buildRuntimeCreds({
     apiKey: session.gateway.apiKey,
     gatewayUrl: session.gateway.gatewayUrl,
     bot,
     ...(isPolymarketBot(bot) ? {} : { hyperliquid: { agentPk: loadAgentKey(session), masterAddress: bot.masterAddress } }),
-    ...(isPolymarketBot(bot) || isTwoVenueBot(bot) ? { polymarket: loadPolymarketCreds(session) } : {}),
+    ...(polymarket ? { polymarket } : {}),
     ...(buybackMasterPk ? { buybackMasterPk } : {}),
   });
 }
@@ -199,7 +210,8 @@ export function runtimeCredsFor(session: KeystoreSession, bot: BotState = sessio
 /**
  * Bring home what a droplet that bought back by itself recorded. When it keeps buying back on the same droplet, its lines are copied
  * and nothing else changes. Otherwise its runner is stopped first, so nothing is written while it is read, and a buyback that is
- * part-way moves to this machine, where strats buyback --execute finishes it. Returns 0 to go on, 1 when the deploy must not.
+ * part-way moves to this machine, where strats buyback --execute finishes it. Returns 0 to go on, 1 when the deploy must not,
+ * and 2 to go on without the record (--force): the caller then turns auto-buyback off.
  */
 function takeBackRecord(bot: BotState, opts: { keepsBuyingBack: boolean; sameDroplet: boolean; force: boolean }): number {
   const target: Target = { host: bot.deployment!.host, user: "root" };
@@ -214,8 +226,8 @@ function takeBackRecord(bot: BotState, opts: { keepsBuyingBack: boolean; sameDro
   const pulled = pullRecord(bot, { moveJournal: opts.sameDroplet });
   if (!pulled.ok) {
     if (opts.force) {
-      console.log(`The droplet's payout record could not be read (${pulled.message}). Going on because of --force. What that droplet paid out is missing from this machine's record, so strats buyback may offer to split the same profit again: check its "Already split" line before you say yes.`);
-      return 0;
+      console.log(`The droplet's payout record could not be read (${pulled.message}). Going on because of --force. What that droplet paid out is missing from this machine's record, so auto-buyback is turned off: the new droplet does not buy back. Check the "Already split" line of strats buyback before you say yes to one.`);
+      return 2;
     }
     restart();
     console.log(`The droplet's payout record could not be read (${pulled.message}). It is the only copy of what the droplet paid out, so nothing was replaced. Try again. If that droplet is gone for good, add --force.`);
@@ -241,8 +253,14 @@ export async function deployBot(args: Args, prompts: Prompts, open?: KeystoreSes
   const region = args.values.region ?? DEFAULT_REGION;
   const size = args.values.size ?? DEFAULT_SIZE;
   if (!/^[a-z0-9-]{2,40}$/.test(region) || !/^[a-z0-9-]{2,60}$/.test(size)) throw new Error("--region and --size take DigitalOcean slugs such as blr1 and s-1vcpu-1gb.");
-  const bot = open?.bot ?? loadBot(resolveBotId(args.values.id));
+  let bot = open?.bot ?? loadBot(resolveBotId(args.values.id));
   const version = packageVersion();
+  if (bot.autoBuyback === true && !autoBuybackAvailable(bot)) {
+    // Set by 0.5.0. A droplet cannot tell a Polymarket deposit from profit, so it is never deployed buying back.
+    bot = { ...bot, autoBuyback: false };
+    if (!args.flags.has("dry-run")) saveBot(bot);
+    console.log(`${AUTO_BUYBACK_UNAVAILABLE} It is now off.`);
+  }
   if ((isPolymarketBot(bot) || isTwoVenueBot(bot)) && US_REGION_SLUGS.includes(region)) {
     throw new Error(`Polymarket refuses orders from the United States, and ${region} is a US region. Choose another, for example --region ${DEFAULT_REGION}.`);
   }
@@ -291,11 +309,20 @@ export async function deployBot(args: Args, prompts: Prompts, open?: KeystoreSes
 
   const session = open ?? requireKeystore(await openSession(args, prompts), "deploy");
   prompts.close();
-  const creds = encodeRuntimeCreds(runtimeCredsFor(session, bot));
   // A droplet that bought back by itself holds the only copy of what it paid out. It comes back to this machine before anything there is replaced.
-  const auto = bot.autoBuyback === true;
   const wasAuto = bot.deployment?.autoBuyback === true;
-  if (wasAuto && takeBackRecord(bot, { keepsBuyingBack: reuse && auto, sameDroplet: reuse, force: args.flags.has("force") }) !== 0) return 1;
+  if (wasAuto) {
+    const took = takeBackRecord(bot, { keepsBuyingBack: reuse && bot.autoBuyback === true, sameDroplet: reuse, force: args.flags.has("force") });
+    if (took === 1) return 1;
+    // The record was given up. Paying from a stale record with nobody watching would split the same profit twice, so this deploy does not buy back.
+    if (took === 2) {
+      bot = withoutDropletRecord(bot, new Date().toISOString());
+      saveBot(bot);
+    }
+  }
+  const auto = bot.autoBuyback === true;
+  // Built after the step above, so a deploy that turned auto-buyback off never reads or sends the wallet key.
+  const creds = encodeRuntimeCreds(runtimeCredsFor(session, bot));
 
   const { publicKey } = ensureKeypair();
   const sshKeyId = await client.upsertSshKey("strats", publicKey);
@@ -307,8 +334,14 @@ export async function deployBot(args: Args, prompts: Prompts, open?: KeystoreSes
     // Replace rather than run two of the same bot against one wallet.
     for (const old of new Map(stale.map((d) => [d.id, d])).values()) {
       const oldHost = publicIpv4(old);
-      if (oldHost) sshExec({ host: oldHost, user: "root" }, `systemctl stop ${unitName(bot.id)}`, undefined, { timeoutMs: 30_000 });
-      await client.deleteDroplet(old.id).catch(() => undefined);
+      // Disabled and without its credentials first, so a droplet that survives the delete holds no key and cannot start again.
+      if (oldHost) sshExec({ host: oldHost, user: "root" }, `systemctl disable --now ${unitName(bot.id)}; rm -f ${envPath(bot.id)}`, undefined, { timeoutMs: 30_000 });
+      try {
+        await client.deleteDroplet(old.id);
+      } catch (error) {
+        // Already gone is fine. Anything else would leave two runners on one wallet, so nothing new is created.
+        if (!(error instanceof DigitalOceanError) || error.status !== 404) throw new Error(`The old droplet ${old.name} could not be deleted (${error instanceof Error ? error.message.slice(0, 160) : "unknown error"}), so no new one was created. Its runner is stopped. Try again, or delete it in DigitalOcean first.`);
+      }
       if (oldHost) forgetHostKey(oldHost);
     }
     const created = await client.createDroplet({
@@ -383,7 +416,7 @@ export async function deployBot(args: Args, prompts: Prompts, open?: KeystoreSes
   saved = { ...saved, deployment: { ...confirmed, deployedAt: new Date().toISOString(), ...(auto ? { autoBuyback: true } : {}) } };
   saveBot(saved);
   if (auto) {
-    console.log("Auto-buyback is on. The droplet checks the profit 10 minutes after it starts and then once a day, and keeps the payout record. strats buyback --execute is refused on this machine meanwhile.");
+    console.log("Auto-buyback is on. The droplet checks the profit once a day, first 10 minutes after its first start, and keeps the payout record. strats buyback --execute is refused on this machine meanwhile.");
   } else {
     // The buyback totals for the public report: two numbers and a list of dates, no secret. Best effort, and it never fails the deploy.
     const payouts = pushPayoutSummary(saved);

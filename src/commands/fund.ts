@@ -5,14 +5,15 @@
 // the same code as its funding step. A single-asset bot that also trades markets
 // has two funding steps, one per venue; --venue polymarket names the second.
 import { UsageError, type Args } from "../args.js";
-import { pushBasis } from "../buyback/droplet.js";
+import { pullRecord, pushBasis, type PullResult, type SyncResult } from "../buyback/droplet.js";
+import { fileJournal } from "../buyback/journal.js";
 import { fetchTarget } from "../client.js";
 import { isFunded } from "../install.js";
 import { loadRuntimeState, saveRuntimeState } from "../runtime-state.js";
 import type { PolymarketCreds } from "../runtime-creds.js";
 import { loadPolymarketCreds, openSession, polymarketSignerRole, requireKeystore, type KeystoreSession } from "../session.js";
 import { makeSetupContext, type Prompts } from "../setup.js";
-import { isPolymarketBot, isTwoVenueBot, marketsStateScope, saveBot } from "../state.js";
+import { isPolymarketBot, isTwoVenueBot, marketsStateScope, saveBot, type BotState } from "../state.js";
 import { buildAdapter } from "../venue.js";
 import { buildPolymarketAdapter } from "../venue-polymarket.js";
 
@@ -26,10 +27,12 @@ export interface FundOptions {
   venue?: "hyperliquid" | "polymarket";
 }
 
-function sayHowToStop(prompts: Prompts, chained: boolean): void {
+function sayHowToStop(prompts: Prompts, chained: boolean, topUp = false): void {
   const again = chained ? "strats init" : "strats fund";
   prompts.interruptMessage = `Stopped. The wallet and its settings are saved. To continue from this step, run: ${again}`;
-  console.log(`This step waits for the deposit to arrive. To stop and continue later, press Ctrl-C and run ${again} again. The wallet is kept, and a deposit that arrives in the meantime is picked up.`);
+  console.log(topUp
+    ? "This step waits for the deposit to arrive. Let it finish: a top-up that arrives after you stop is not added to the deposits figure, and would count as profit. If that happens: strats buyback --set-deposits <usd>"
+    : `This step waits for the deposit to arrive. To stop and continue later, press Ctrl-C and run ${again} again. The wallet is kept, and a deposit that arrives in the meantime is picked up.`);
   console.log("");
 }
 
@@ -72,7 +75,7 @@ async function fundPolymarket(session: KeystoreSession, prompts: Prompts, opts: 
     console.log("The droplet's automatic buyback is paused until this deposit is recorded. If you stop before then, it stays paused until strats fund finishes.");
   }
   if (skipDepositWait) console.log(`The deposit wallet already holds ${before!.toFixed(2)} pUSD, so this does not wait for another deposit. It checks the trading approvals.`);
-  else sayHowToStop(prompts, opts.chained === true);
+  else sayHowToStop(prompts, opts.chained === true, fundedBefore);
   await adapter.runFundingFlow(makeSetupContext(bot.id, session.keystore, session.passphrase, prompts, { skipDepositWait, masterRole: polymarketSignerRole(bot) }), acct);
   const after = await read();
   if (after !== undefined) {
@@ -92,12 +95,48 @@ async function fundPolymarket(session: KeystoreSession, prompts: Prompts, opts: 
   // A two-venue bot records this step on its own, so the perp's funding step is never taken for it.
   session.bot = twoVenue ? { ...bot, markets: { fundedAt: new Date().toISOString() } } : { ...bot, fundedAt: new Date().toISOString() };
   saveBot(session.bot);
+  if (twoVenue && bot.deployment && fundedBefore) console.log("The droplet does not learn of this deposit, so the public profit figure counts it as profit. Buybacks are not affected: they are measured on Hyperliquid.");
   if (opts.chained) return 0;
   console.log("");
   if (twoVenue && bot.deployment) console.log("The droplet trades the markets once it has the Polymarket credentials. To send them: strats deploy");
   console.log("Next: strats run --dry-run --once   (shows what it would do, sends nothing)");
   console.log("Then: strats deploy   (or strats run, from a location where Polymarket accepts orders)");
   return 0;
+}
+
+export interface FundGuardPorts {
+  /** This machine's buyback journal. It throws when the file cannot be read. */
+  localJournal(): unknown;
+  pause(): SyncResult;
+  pull(): PullResult;
+  release(): SyncResult;
+}
+
+export type FundGuard = { ok: true; held: boolean } | { ok: false; message: string };
+
+/**
+ * strats fund deposits the wallet's whole USDC balance and uses the wallet's next nonce. While a buyback is part-way its money is in,
+ * or on its way to, that same wallet, so funding is refused: here for any stage and for a record that cannot be read, and on a droplet
+ * that buys back by itself, which is paused first so it starts nothing during the wait. `held` means the caller must release the pause.
+ */
+export function guardPartWayBuyback(bot: Pick<BotState, "deployment">, ports: FundGuardPorts): FundGuard {
+  let open = true;
+  try {
+    open = ports.localJournal() !== null;
+  } catch {
+    // Unreadable counts as part-way.
+  }
+  if (open) return { ok: false, message: "A buyback is part-way, and its money is in, or on its way to, this wallet. strats fund would deposit it back into Hyperliquid. Finish it first: strats buyback --execute" };
+  if (bot.deployment?.autoBuyback !== true) return { ok: true, held: false };
+  const paused = ports.pause();
+  if (!paused.ok) return { ok: false, message: `The droplet's automatic buyback could not be paused (${paused.message}), and strats fund would deposit the money of a buyback it has part-way. Nothing was changed. Try again.` };
+  const pulled = ports.pull();
+  if (pulled.ok && pulled.journal === "none") return { ok: true, held: true };
+  const released = ports.release();
+  const why = pulled.ok
+    ? `The droplet is part-way through a buyback (${pulled.stage ?? "stage unknown"}), and its money is in, or on its way to, this wallet. It continues at its next check. Run strats fund after it finishes.`
+    : `The droplet could not be asked whether a buyback is part-way (${pulled.message}). Nothing was changed. Try again.`;
+  return { ok: false, message: released.ok ? why : `${why} Its automatic buyback stays paused; to resume it: strats buyback --sync` };
 }
 
 export async function fund(args: Args, prompts: Prompts): Promise<number> {
@@ -112,6 +151,28 @@ export async function fundSession(session: KeystoreSession, args: Args, prompts:
   if (opts.venue !== undefined && !isTwoVenueBot(bot)) throw new UsageError("--venue applies to a single-asset bot that also trades Polymarket markets. This bot has one venue.");
   if (isPolymarketBot(bot) || opts.venue === "polymarket") return fundPolymarket(session, prompts, opts);
 
+  const guard = guardPartWayBuyback(bot, {
+    localJournal: () => fileJournal(bot.id).load(),
+    pause: () => pushBasis(bot, { hold: true }),
+    pull: () => pullRecord(bot, { moveJournal: false }),
+    release: () => pushBasis(bot),
+  });
+  if (!guard.ok) {
+    console.log(guard.message);
+    return 1;
+  }
+  if (!guard.held) return fundHyperliquid(session, args, prompts, opts);
+  console.log("The droplet's automatic buyback is paused until this finishes.");
+  try {
+    return await fundHyperliquid(session, args, prompts, opts);
+  } finally {
+    const released = pushBasis(session.bot);
+    if (!released.ok) console.log(`The droplet's automatic buyback stays paused (${released.message}). To resume it: strats buyback --sync`);
+  }
+}
+
+async function fundHyperliquid(session: KeystoreSession, args: Args, prompts: Prompts, opts: FundOptions): Promise<number> {
+  const { bot } = session;
   // The asset decides the venue account: main-dex coins trade from the main account, HIP-3 coins from their own dex.
   let dex = args.values.dex === "main" ? "" : args.values.dex;
   if (dex === undefined) {

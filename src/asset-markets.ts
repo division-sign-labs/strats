@@ -1,5 +1,8 @@
-// The local check for a single-asset bot's Polymarket markets. The creator chose
-// the markets and a direction; each cycle the targets the server names are checked
+// The local check for a single-asset bot's Polymarket markets. On a legacy key the
+// creator chose the markets and a direction. On a managed key the server chooses
+// the markets, and each one is confirmed on Polymarket instead (managed-markets.ts);
+// which outcome is the long side is then the server's word, so the direction is
+// not checked here. Each cycle the targets the server names are checked
 // against both and against the rule itself: Q has forecast the market, the price
 // limit is at least 70 cents and at most 97, and Q is at least 5 points above it.
 // A target that fails is dropped, and its market stays so a holding can still be
@@ -23,7 +26,7 @@ export interface AssetCycleMarkets {
   refused: string[];
 }
 
-type AssetStrategy = Pick<ConfigDoc["config"]["strategy"], "direction" | "markets">;
+type AssetStrategy = Pick<ConfigDoc["config"]["strategy"], "direction" | "markets" | "universe">;
 
 const EPSILON = 1e-9;
 const short = (conditionId: string): string => (conditionId.length > 12 ? `${conditionId.slice(0, 10)}...` : conditionId);
@@ -33,9 +36,11 @@ const other = (side: 0 | 1): 0 | 1 => (side === 0 ? 1 : 0);
  * `heldTokenIds` is optional: with it, a market that has no target takes the side
  * the wallet holds. The side only matters for a buy, and a buy always has a target.
  */
-export function assetMarketsForCycle(doc: AssetMarketsTargetsDoc, strategy: AssetStrategy, heldTokenIds: readonly string[] = []): AssetCycleMarkets {
-  const direction = strategy.direction ?? "both";
-  const configured = strategy.markets ?? [];
+export function assetMarketsForCycle(doc: AssetMarketsTargetsDoc, strategy: AssetStrategy, heldTokenIds: readonly string[] = [], managedMarkets: readonly ThemeMarket[] = []): AssetCycleMarkets {
+  const managed = strategy.universe === "managed";
+  // A managed market's side is the outcome its target buys, so there is no long side to hold the direction against.
+  const direction = managed ? "both" : strategy.direction ?? "both";
+  const configured = managed ? managedMarkets : strategy.markets ?? [];
   const byCondition = new Map(configured.map((market) => [market.conditionId.toLowerCase(), market]));
   const sideOf = new Map<string, 0 | 1>();
   const refused: string[] = [];
@@ -43,7 +48,7 @@ export function assetMarketsForCycle(doc: AssetMarketsTargetsDoc, strategy: Asse
   const targets = doc.targets.filter((target) => {
     const label = short(target.conditionId);
     const market = byCondition.get(target.conditionId.toLowerCase());
-    if (!market) { refused.push(`${label}: not one of the configured markets, refused.`); return false; }
+    if (!market) { refused.push(`${label}: ${managed ? "not confirmed on Polymarket" : "not one of the configured markets"}, refused.`); return false; }
     const bought = market.tokenIds.indexOf(target.tokenId);
     if (bought !== 0 && bought !== 1) { refused.push(`${label}: the target names a token that is not in this market, refused.`); return false; }
     if (direction === "long" && bought !== market.side) { refused.push(`${label}: the target buys the outcome a long-only key does not take, refused.`); return false; }

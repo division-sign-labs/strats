@@ -15,6 +15,7 @@ import {
   type VenueAccount,
   type VenueAdapter,
 } from "@quotient-forecasting/cassie-core";
+import type { MarketFacts } from "./managed-markets.js";
 import type { ThemeMarket } from "./protocol/index.js";
 import { THEME_MIN_ORDER_USD, floorShares, type ThemeAction, type ThemeHolding, type ThemeQuote } from "./reconcile-theme.js";
 import type { PolymarketCreds } from "./runtime-creds.js";
@@ -163,6 +164,26 @@ export class PolymarketVenue {
     const exposureUsd = holdings.reduce((sum, h) => sum + h.valueUsd, 0);
     const pendingTokenIds = orders.filter((o) => o.tokenId && o.size - o.filledSize > 0).map((o) => o.tokenId!);
     return { collateralUsd, exposureUsd, equityUsd: collateralUsd + exposureUsd, holdings, quotes, books, pendingTokenIds, orders };
+  }
+
+  /**
+   * What Polymarket itself says about each token's market, for a managed key. A token that cannot be looked up is left out, and
+   * its market is then not traded. The adapter keeps each answer, so a market is asked about once per run.
+   */
+  async marketFacts(tokenIds: readonly string[]): Promise<Map<string, MarketFacts>> {
+    const lookup = (this.adapter as unknown as { marketInfoForToken?(tokenId: string): Promise<{ conditionId: unknown; info: { tokens?: unknown } }> }).marketInfoForToken;
+    const out = new Map<string, MarketFacts>();
+    if (typeof lookup !== "function") return out;
+    await mapLimited([...new Set(tokenIds)], BOOK_CONCURRENCY, async (tokenId) => {
+      try {
+        const { conditionId, info } = await lookup.call(this.adapter, tokenId);
+        const tokens = Array.isArray(info.tokens) ? info.tokens.map((t: { tokenId?: unknown; outcome?: unknown }) => ({ tokenId: String(t.tokenId ?? ""), outcome: String(t.outcome ?? "") })) : [];
+        if (typeof conditionId === "string" && conditionId !== "" && tokens.every((t) => t.tokenId !== "")) out.set(tokenId, { conditionId, tokens });
+      } catch {
+        // Not confirmed: the market is left out this cycle.
+      }
+    });
+    return out;
   }
 
   /** Cumulative notional of confirmed fills since `sinceTs`. */

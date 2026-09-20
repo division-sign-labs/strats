@@ -1,10 +1,12 @@
 // LI.FI finds the route from the withdrawn dollars to the pinned token and
-// returns a transaction to sign. The calldata is opaque to us, so every quote
-// is checked on its envelope, and a quote that fails any check is rejected,
-// never adjusted: the chains, tokens, amount and addresses must be ours, the
+// returns a transaction to sign. Every quote is checked on its envelope, and
+// where the calldata decodes (see readCalldata) on what is actually signed: the
+// recipient, the destination chain and, for a same-chain swap, the minimum. A
+// quote that fails any check is rejected, never adjusted: the chains, tokens, amount and addresses must be ours, the
 // spender and the target must be the pinned LI.FI contract, the transaction
 // must carry no native value, and the promised minimum must clear the floor.
 // The allowance is exactly one payout, which caps what a bad route could take.
+import { decodeAbiParameters, type Hex } from "viem";
 import { z } from "zod";
 
 export const LIFI_API = "https://li.quest/v1";
@@ -64,7 +66,12 @@ export interface QuoteRequest {
   toAddress: string;
   /** Percent, for example 1. */
   slippagePct: number;
+  /** Bridges LI.FI must not route through. */
+  denyBridges?: readonly string[];
 }
+
+/** Bridges whose signed transaction does not carry the token minimum: the minimum is then only the solver's promise. Never used unattended. */
+export const UNBOUND_MINIMUM_BRIDGES = ["layerswap", "relaydepository", "relay", "near"] as const;
 
 export type QuoteFailure = { ok: false; kind: "no-route" | "unavailable" | "invalid"; message: string };
 export type QuoteResult = { ok: true; quote: Quote } | QuoteFailure;
@@ -76,6 +83,7 @@ export function quoteUrl(request: QuoteRequest): string {
     fromAddress: request.fromAddress, toAddress: request.toAddress,
     slippage: String(request.slippagePct / 100), integrator: "strats",
   });
+  for (const bridge of request.denyBridges ?? []) query.append("denyBridges", bridge);
   return `${LIFI_API}/quote?${query.toString()}`;
 }
 
@@ -120,6 +128,67 @@ export interface QuoteExpectation extends QuoteRequest {
   maxImpactPct: number;
   /** When set, the quote must promise at least this many token units. */
   floorMinOut?: bigint;
+  /** Unattended: refuse unless the calldata decodes and carries the token minimum. A person is told instead (calldataNote). */
+  requireBoundMinimum?: boolean;
+}
+
+/** What the transaction that is signed says, where it can be read. */
+export type Calldata =
+  | { decoded: false }
+  | { decoded: true; kind: "swap"; receiver: string; minAmountOut: bigint }
+  | { decoded: true; kind: "bridge"; receiver: string; destinationChainId: bigint; minAmount: bigint; hasDestinationCall: boolean };
+
+const SWAP_HEAD = [{ type: "bytes32" }, { type: "string" }, { type: "string" }, { type: "address" }, { type: "uint256" }] as const;
+const BRIDGE_DATA = [{
+  type: "tuple",
+  components: [
+    { name: "transactionId", type: "bytes32" }, { name: "bridge", type: "string" }, { name: "integrator", type: "string" }, { name: "referrer", type: "address" },
+    { name: "sendingAssetId", type: "address" }, { name: "receiver", type: "address" }, { name: "minAmount", type: "uint256" },
+    { name: "destinationChainId", type: "uint256" }, { name: "hasSourceSwaps", type: "bool" }, { name: "hasDestinationCall", type: "bool" },
+  ],
+}] as const;
+
+/**
+ * LI.FI's two call shapes. A same-chain swap starts (transactionId, integrator, referrer, receiver, minAmountOut, ...); a bridge call
+ * starts with ILiFi.BridgeData. Anything that does not decode as the shape its chains call for is "not decoded", never guessed.
+ */
+export function readCalldata(data: string, sameChain: boolean): Calldata {
+  if (!/^0x[0-9a-fA-F]{8,}$/.test(data)) return { decoded: false };
+  const body = `0x${data.slice(10)}` as Hex;
+  try {
+    if (sameChain) {
+      const [, , , receiver, minAmountOut] = decodeAbiParameters(SWAP_HEAD, body);
+      return { decoded: true, kind: "swap", receiver, minAmountOut };
+    }
+    const [bridge] = decodeAbiParameters(BRIDGE_DATA, body);
+    return { decoded: true, kind: "bridge", receiver: bridge.receiver, destinationChainId: bridge.destinationChainId, minAmount: bridge.minAmount, hasDestinationCall: bridge.hasDestinationCall };
+  } catch {
+    return { decoded: false };
+  }
+}
+
+const word = (value: bigint): string => value.toString(16).padStart(64, "0");
+
+/** True when the signed transaction itself carries the token minimum, so the chain, not a solver's promise, enforces it. */
+export function minimumIsBound(quote: Quote): boolean {
+  const { action, estimate, transactionRequest: tx } = quote;
+  const call = readCalldata(tx.data, action.fromChainId === action.toChainId);
+  if (!call.decoded) return false;
+  const minOut = BigInt(estimate.toAmountMin);
+  if (call.kind === "swap") return call.minAmountOut >= minOut;
+  // A bridge call: the minimum and the token must both be written somewhere in it. Mayan writes amounts with 8 decimals.
+  const data = tx.data.toLowerCase();
+  const decimals = action.toToken.decimals;
+  const forms = [word(minOut), ...(decimals > 8 ? [word(minOut / 10n ** BigInt(decimals - 8))] : [])];
+  return /^0x[0-9a-fA-F]{40}$/.test(action.toToken.address) && data.includes(action.toToken.address.slice(2).toLowerCase().padStart(64, "0")) && forms.some((form) => data.includes(form));
+}
+
+/** One plain sentence for a person when part of the quote is LI.FI's word and not in what they sign. Null when everything was read. */
+export function calldataNote(quote: Quote): string | null {
+  const call = readCalldata(quote.transactionRequest.data, quote.action.fromChainId === quote.action.toChainId);
+  if (!call.decoded) return "This transaction could not be decoded, so the recipient and the minimum are LI.FI's word: they were not checked in what you sign.";
+  if (!minimumIsBound(quote)) return `The minimum is the promise of LI.FI's route (${quote.tool}), not written into what you sign. If the route cannot deliver, ${quote.action.fromToken.symbol} arrives at the destination or is refunded.`;
+  return null;
 }
 
 const sameAddress = (a: string | undefined, b: string): boolean => typeof a === "string" && a.toLowerCase() === b.toLowerCase();
@@ -152,6 +221,16 @@ export function checkQuote(quote: Quote, expect: QuoteExpectation): string[] {
   if (tx.from !== undefined && !sameAddress(tx.from, expect.fromAddress)) failures.push("the transaction is written for a different sender");
   if (tx.chainId !== expect.fromChainId) failures.push("the transaction is for a different chain");
   if (tx.data.length <= 2) failures.push("the transaction carries no call");
+  // The money follows the calldata, not the envelope above.
+  const call = readCalldata(tx.data, expect.fromChainId === expect.toChainId);
+  if (call.decoded) {
+    if (!sameAddress(call.receiver, expect.toAddress)) failures.push("the transaction you would sign delivers to a different address");
+    if (call.kind === "bridge" && call.destinationChainId !== BigInt(expect.toChainId)) failures.push("the transaction you would sign ends on a different chain");
+    if (call.kind === "swap" && call.minAmountOut < BigInt(estimate.toAmountMin)) failures.push("the transaction you would sign accepts less than the quote promises");
+  } else if (expect.requireBoundMinimum === true) {
+    failures.push("the transaction could not be decoded, so its recipient cannot be checked");
+  }
+  if (call.decoded && expect.requireBoundMinimum === true && !minimumIsBound(quote)) failures.push(`the minimum is not written into the transaction (route ${quote.tool})`);
   let value: bigint | null = null;
   try {
     value = BigInt(tx.value ?? "0x0");

@@ -11,25 +11,30 @@
 // buyback --execute runs. It never runs inside a trading cycle, never two at a
 // time, and an error costs one log line and a wait until the next check.
 import { randomBytes } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { fetchTarget } from "../client.js";
 import { appendLedger, readLedger, summarize, type Ledger, type LedgerLine } from "../payouts.js";
+import { buybackCheckFile, writePrivateFile } from "../paths.js";
 import { usd } from "../reconcile.js";
 import { loadWalletKey, scrub, sessionSecrets, type Session } from "../session.js";
-import { isPolymarketBot } from "../state.js";
+import { autoBuybackAvailable, isPolymarketBot } from "../state.js";
 import { loadBasis, mergeBasisLedger, type BuybackBasis } from "./basis.js";
 import { SOURCE_CHAINS, chainWallet, checkGas, type ChainWallet } from "./chain.js";
 import { fileJournal, type JournalStore } from "./journal.js";
-import { checkQuote, fetchQuote, fetchStatus, floorFrom, type QuoteExpectation, type QuoteRequest, type QuoteResult, type StatusExpectation, type SwapStatus } from "./lifi.js";
+import { UNBOUND_MINIMUM_BRIDGES, checkQuote, fetchQuote, fetchStatus, floorFrom, type QuoteExpectation, type QuoteRequest, type QuoteResult, type StatusExpectation, type SwapStatus } from "./lifi.js";
 import { resumePayout, startPayout, tokenAmount, type BuybackDeps, type Outcome } from "./machine.js";
 import { MAX_IMPACT_DEFAULT, MIN_USD_DEFAULT, SLIPPAGE_DEFAULT, planBuyback, refusalText } from "./plan.js";
 import { SUPPORTED_TOKEN_CHAINS, chainLabel } from "./text.js";
-import { BuybackRefusal, hyperliquidVenue, polymarketVenue, type BuybackVenuePort } from "./venues.js";
+import { BuybackRefusal, checkedFigures, hyperliquidVenue, polymarketVenue, type BuybackVenuePort } from "./venues.js";
 
 /** The first check after the runner starts, and the wait between checks. */
 export const AUTO_FIRST_MS = 10 * 60_000;
 export const AUTO_EVERY_MS = 24 * 60 * 60_000;
 /** Every line of the unattended buyback starts with this word, so strats status can find the last one. */
 export const AUTO_TAG = "buyback";
+
+/** Unattended, one check never splits more than this share of the account value. A constant: no file, flag or server answer changes it. */
+export const AUTO_MAX_SPLIT_PCT = 25;
 
 /** The command's own defaults. Unattended, nothing can raise them. */
 export const AUTO_SETTINGS = { minUsd: MIN_USD_DEFAULT, slippagePct: SLIPPAGE_DEFAULT, maxImpactPct: MAX_IMPACT_DEFAULT } as const;
@@ -39,6 +44,8 @@ export class AutoBuybackRefused extends Error {}
 /** The two conditions for paying out with nobody watching. Checked before anything is read, and again where the machine would have asked a person. */
 export function assertUnattendedAllowed(session: Pick<Session, "bot" | "runtime">): void {
   if (session.bot.autoBuyback !== true) throw new AutoBuybackRefused("Auto-buyback is off for this bot, so nothing is paid out unattended. To turn it on: strats config auto-buyback on, then strats deploy.");
+  if (!autoBuybackAvailable(session.bot)) throw new AutoBuybackRefused("Nothing is paid out unattended for a theme or team bot: Polymarket shows no deposit history, so a deposit could be taken for profit. On your own machine: strats config auto-buyback off, strats deploy, then strats buyback --execute");
+  if (session.bot.payoutRecordIncomplete) throw new AutoBuybackRefused("Nothing is paid out unattended: this bot's payout record may be missing what a lost droplet paid. On your own machine run: strats buyback");
   if (!session.runtime) throw new AutoBuybackRefused("The automatic buyback runs only on the droplet, from the credentials strats deploy sent. On this machine, use: strats buyback --execute");
 }
 
@@ -89,6 +96,8 @@ export async function runUnattended(session: Pick<Session, "bot" | "runtime">, p
   const expectation = (token: { chainId: number; address: string }, destination: string, amount: bigint, floorMinOut?: bigint): QuoteExpectation => ({
     fromChainId: source.chainId, toChainId: token.chainId, fromToken: source.token, toToken: token.address, fromAmount: amount,
     fromAddress: bot.masterAddress, toAddress: destination, slippagePct, maxImpactPct, ...(floorMinOut !== undefined ? { floorMinOut } : {}),
+    // Nobody reads a warning here, so only a route whose signed transaction carries the recipient and the minimum is used.
+    denyBridges: UNBOUND_MINIMUM_BRIDGES, requireBoundMinimum: true,
   });
   const deps = (token: { chainId: number; address: string }, destination: string): BuybackDeps => ({
     venue: ports.venue, wallet: ports.wallet,
@@ -113,7 +122,7 @@ export async function runUnattended(session: Pick<Session, "bot" | "runtime">, p
       assertUnattendedAllowed(session);
       return true;
     },
-    describeQuote: (quote) => [`A new quote promises at least ${tokenAmount(quote.estimate.toAmountMin, quote.action.toToken.decimals)} ${quote.action.toToken.symbol}, within ${slippagePct}% slippage and ${maxImpactPct}% price impact.`],
+    describeQuote: (quote) => [`A new quote (route ${quote.tool}) promises at least ${tokenAmount(quote.estimate.toAmountMin, quote.action.toToken.decimals)} ${quote.action.toToken.symbol}, within ${slippagePct}% slippage and ${maxImpactPct}% price impact.`],
     tokenChainName: chainLabel(token.chainId),
   });
 
@@ -143,7 +152,7 @@ export async function runUnattended(session: Pick<Session, "bot" | "runtime">, p
   const payouts = summarize(ledger.lines);
   let figures;
   try {
-    figures = await ports.venue.figures(payouts);
+    figures = await checkedFigures(ports.venue, payouts);
   } catch (error) {
     if (!(error instanceof BuybackRefusal)) throw error;
     say(`Nothing is paid: ${error.message}`);
@@ -153,6 +162,12 @@ export async function runUnattended(session: Pick<Session, "bot" | "runtime">, p
   const refusal = refusalText(plan, usd);
   if (refusal) {
     say(`Profit to split ${usd(plan.distributableUsd)}. ${refusal}`);
+    return null;
+  }
+
+  // A person would stop at a payout this large and ask where the money came from. Nothing from the server or a file can raise the bound.
+  if (plan.distributableUsd > (figures.equityUsd * AUTO_MAX_SPLIT_PCT) / 100) {
+    say(`Nothing is paid: the profit to split, ${usd(plan.distributableUsd)}, is more than ${AUTO_MAX_SPLIT_PCT}% of the account's ${usd(figures.equityUsd)}, too much for one unattended check. To pay it yourself: strats config auto-buyback off, strats deploy, then strats buyback --execute`);
     return null;
   }
 
@@ -175,7 +190,7 @@ export async function runUnattended(session: Pick<Session, "bot" | "runtime">, p
   }
 
   const floorMinOut = floorFrom(quote);
-  say(`Profit to split ${usd(plan.distributableUsd)}. Withdrawing ${usd(plan.withdrawUsd)} from ${ports.venue.label} to buy at least ${tokenAmount(floorMinOut, quote.action.toToken.decimals)} ${quote.action.toToken.symbol} for ${destination}.`);
+  say(`Profit to split ${usd(plan.distributableUsd)}. Withdrawing ${usd(plan.withdrawUsd)} from ${ports.venue.label} to buy, through LI.FI's ${quote.tool} route, at least ${tokenAmount(floorMinOut, quote.action.toToken.decimals)} ${quote.action.toToken.symbol} for ${destination}.`);
   assertUnattendedAllowed(session);
   return startPayout(deps(token, destination), {
     id: ports.newId(), ...(venueName === "hyperliquid" && ports.dex !== undefined ? { dex: ports.dex } : {}),
@@ -249,6 +264,26 @@ export function scheduleChecks(check: () => Promise<void>, say: (text: string) =
   };
 }
 
+/**
+ * The wait before the first check of a run. "Once a day" must survive a restart: a runner that restarts, or is redeployed, waits out
+ * the rest of the day since its last check. A buyback that is part-way is still continued after 10 minutes.
+ */
+export function firstCheckDelay(lastCheckAt: number | null, now: number, journalOpen: boolean): number {
+  if (journalOpen || lastCheckAt === null || !Number.isFinite(lastCheckAt) || lastCheckAt > now) return AUTO_FIRST_MS;
+  return Math.max(AUTO_FIRST_MS, lastCheckAt + AUTO_EVERY_MS - now);
+}
+
+function lastCheckAt(botId: string): number | null {
+  try {
+    const path = buybackCheckFile(botId);
+    if (!existsSync(path)) return null;
+    const at = Date.parse(String((JSON.parse(readFileSync(path, "utf8")) as { at?: unknown }).at));
+    return Number.isFinite(at) ? at : null;
+  } catch {
+    return null;
+  }
+}
+
 /** The real venue, wallet, files and LI.FI, for the droplet. Built afresh for every check, so nothing is carried from one day to the next. */
 export async function dropletPorts(session: Session, say: (text: string) => void): Promise<AutoPorts> {
   assertUnattendedAllowed(session);
@@ -320,8 +355,24 @@ export function startAutoBuyback(session: Session, opts: AutoBuybackOptions): Ch
   } catch {
     // The first check tries again and says what is wrong.
   }
-  say(`Auto-buyback is on. The first check is in ${Math.round(AUTO_FIRST_MS / 60_000)} minutes, then once a day. It pays when the buyback share is at least ${usd(AUTO_SETTINGS.minUsd)}.`);
+  let journalOpen = true;
+  try {
+    journalOpen = fileJournal(bot.id).load() !== null;
+  } catch {
+    // Unreadable counts as part-way: the first check says what is wrong.
+  }
+  const firstMs = firstCheckDelay(lastCheckAt(bot.id), Date.now(), journalOpen);
+  const wait = firstMs < 90 * 60_000 ? `${Math.round(firstMs / 60_000)} minutes` : `about ${Math.round(firstMs / 3_600_000)} hours`;
+  say(`Auto-buyback is on. The first check is in ${wait}, then once a day. It pays when the buyback share is at least ${usd(AUTO_SETTINGS.minUsd)}.`);
   return scheduleChecks(async () => {
-    await runUnattended(session, await dropletPorts(session, say));
-  }, say);
+    try {
+      await runUnattended(session, await dropletPorts(session, say));
+    } finally {
+      try {
+        writePrivateFile(buybackCheckFile(bot.id), `${JSON.stringify({ at: new Date().toISOString() })}\n`);
+      } catch {
+        // Without the file the next start checks after 10 minutes, as before.
+      }
+    }
+  }, say, { firstMs });
 }

@@ -73,7 +73,7 @@ export async function status(args: Args, prompts: Prompts): Promise<number> {
     const { strategy, account } = config.value.config;
     row("Config version", `${config.value.version}, updated ${config.value.updatedAt}`);
     row("Asset", strategy.assetKey);
-    if (isTwoVenueBot(bot)) row("Markets", `${strategy.markets?.length ?? 0} on Polymarket`);
+    if (isTwoVenueBot(bot)) row("Markets", strategy.universe === "managed" ? "on Polymarket, chosen by Q" : `${strategy.markets?.length ?? 0} on Polymarket`);
     row("Position size", `${account.positionPct}% configured, ${Math.min(account.positionPct, bot.ceilingPct, 50)}% in force`);
   } else {
     row("Config", `not available. ${config.message}`);

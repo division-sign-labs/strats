@@ -3,8 +3,9 @@
 // trades the markets its creator chose, a team bot trades its team's games after
 // the local check in team-markets.ts, and a single-asset bot trades its asset's
 // markets after the local check in asset-markets.ts.
-import { assetMarketsForCycle } from "./asset-markets.js";
+import { ASSET_MARKET_MIN_EDGE, ASSET_MARKET_MIN_PRICE, assetMarketsForCycle } from "./asset-markets.js";
 import { fetchAssetMarketsTargets, fetchConfig, fetchTeamConfig, fetchTeamTargets, fetchThemeConfig, fetchThemeTargets, type FetchResult, type GatewayOptions } from "./client.js";
+import { isManaged } from "./protocol/index.js";
 import type { AssetMarketsTargetsDoc, ConfigDoc, TeamConfigDoc, TeamTargetsDoc, ThemeConfigDoc, ThemeMarket, ThemeTargetsDoc } from "./protocol/index.js";
 import { isTwoVenueBot, type BotState } from "./state.js";
 import { teamMarketsForCycle, themeView } from "./team-markets.js";
@@ -29,8 +30,13 @@ export interface PolymarketSource<C extends PolymarketConfigDoc = PolymarketConf
   label: "theme" | "team" | "markets";
   fetchConfig(gateway: GatewayOptions): Promise<FetchResult<C>>;
   fetchTargets(gateway: GatewayOptions): Promise<FetchResult<T>>;
-  /** Without settings there is nothing to check a market against, so the list is empty and nothing is traded. */
-  marketsFor(config: C | undefined, targets: T): CycleMarkets;
+  /**
+   * Without settings there is nothing to check a market against, so the list is empty and nothing is traded.
+   * `managedMarkets` is read only for a managed key: the markets of this document, as confirmed on Polymarket.
+   */
+  marketsFor(config: C | undefined, targets: T, managedMarkets?: readonly ThemeMarket[]): CycleMarkets;
+  /** Held against the live book when an order is about to be placed. */
+  entryRule?: { minBuyPrice: number; minEdge: number };
 }
 
 export const THEME_SOURCE: PolymarketSource<ThemeConfigDoc, ThemeTargetsDoc> = {
@@ -38,8 +44,8 @@ export const THEME_SOURCE: PolymarketSource<ThemeConfigDoc, ThemeTargetsDoc> = {
   label: "theme",
   fetchConfig: fetchThemeConfig,
   fetchTargets: fetchThemeTargets,
-  marketsFor: (config, targets) => ({
-    markets: config?.config.strategy.markets ?? [], doc: targets, refused: [],
+  marketsFor: (config, targets, managedMarkets = []) => ({
+    markets: isManaged(config) ? [...managedMarkets] : config?.config.strategy.markets ?? [], doc: targets, refused: [],
     quoteTokenIds: [...targets.targets.map((t) => t.tokenId), ...targets.closed.map((c) => c.tokenId)],
   }),
 };
@@ -62,8 +68,9 @@ export const ASSET_SOURCE: PolymarketSource<ConfigDoc, AssetMarketsTargetsDoc> =
   label: "markets",
   fetchConfig,
   fetchTargets: fetchAssetMarketsTargets,
-  marketsFor: (config, targets) => ({
-    ...assetMarketsForCycle(targets, config?.config.strategy ?? {}),
+  entryRule: { minBuyPrice: ASSET_MARKET_MIN_PRICE, minEdge: ASSET_MARKET_MIN_EDGE },
+  marketsFor: (config, targets, managedMarkets = []) => ({
+    ...assetMarketsForCycle(targets, config?.config.strategy ?? {}, [], managedMarkets),
     quoteTokenIds: [...targets.targets.map((t) => t.tokenId), ...targets.closed.map((c) => c.tokenId)],
   }),
 };

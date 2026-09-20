@@ -2,7 +2,8 @@
 import { UsageError, type Args } from "../args.js";
 import { fetchTarget, fetchTeamTargets } from "../client.js";
 import { sourceFor } from "../polymarket-source.js";
-import { dexOfCoin, type ThemeMarket } from "../protocol/index.js";
+import { managedMarketsForCycle } from "../managed-markets.js";
+import { dexOfCoin, isManaged, type ThemeMarket } from "../protocol/index.js";
 import { px, usd } from "../reconcile.js";
 import { loadAgentKey, loadPolymarketCreds, openSession, scrub, sessionSecrets, type Session } from "../session.js";
 import type { Prompts } from "../setup.js";
@@ -16,7 +17,13 @@ async function closableMarkets(session: Session): Promise<{ ok: true; markets: T
   const source = sourceFor(session.bot);
   const config = await source.fetchConfig(session.gateway);
   if (!config.ok) return { ok: false, message: `Could not read the ${source.strategyId === "team" ? "settings" : "configured markets"}. ${config.message}` };
-  if (config.value.config.strategyId === "theme") return { ok: true, markets: config.value.config.strategy.markets };
+  if (isManaged(config.value)) {
+    // A managed key has no list: what the wallet holds is confirmed on Polymarket, and every confirmed market may be sold from.
+    const venue = new PolymarketVenue(session.bot.polymarket!, loadPolymarketCreds(session), { readOnly: true });
+    const held = (await venue.snapshot([], [])).holdings.map((h) => h.tokenId);
+    return { ok: true, markets: managedMarketsForCycle({ targets: [], closed: [] }, await venue.marketFacts(held), held).markets };
+  }
+  if (config.value.config.strategyId === "theme") return { ok: true, markets: config.value.config.strategy.markets ?? [] };
   if (config.value.config.strategyId === "stock-ls") return { ok: true, markets: config.value.config.strategy.markets ?? [] };
   // A team bot has no list of its own: its markets are the team's games, named by the targets document.
   const targets = await fetchTeamTargets(session.gateway);

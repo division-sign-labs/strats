@@ -20,7 +20,7 @@ import { checkQuote, fetchQuote, fetchStatus, floorFrom, type QuoteExpectation }
 import { moneyText, resumePayout, startPayout, type BuybackDeps, type Outcome } from "../buyback/machine.js";
 import { MAX_IMPACT_DEFAULT, MIN_USD_DEFAULT, MIN_USD_FLOOR, SLIPPAGE_DEFAULT, planBuyback, refusalText } from "../buyback/plan.js";
 import { CONFIRM_QUESTION, DRY_RUN_FOOTER, SUPPORTED_TOKEN_CHAINS, chainLabel, renderConfirmation, renderHeader, renderProfit, renderQuote, renderRoute, renderSplit, type RouteContext } from "../buyback/text.js";
-import { BuybackRefusal, hyperliquidVenue, polymarketVenue, type BuybackVenuePort } from "../buyback/venues.js";
+import { BuybackRefusal, checkedFigures, hyperliquidVenue, polymarketVenue, type BuybackVenuePort } from "../buyback/venues.js";
 import { fetchTarget } from "../client.js";
 import { payoutsLedgerFile } from "../paths.js";
 import { PUSH_FAILED_TEXT, appendLedger, pushPayoutSummary, readLedger, summarize, writePayoutSummary } from "../payouts.js";
@@ -298,7 +298,7 @@ export async function buyback(args: Args, prompts: Prompts): Promise<number> {
   ctx.earlierBuybacks = payouts.withdrawals.length;
   let figures;
   try {
-    figures = await venue.figures(payouts);
+    figures = await checkedFigures(venue, payouts);
   } catch (error) {
     if (!(error instanceof BuybackRefusal)) throw error;
     print(error.message);

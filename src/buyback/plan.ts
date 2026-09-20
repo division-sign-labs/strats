@@ -60,6 +60,13 @@ const toCents = (usd: number): number => Math.floor(usd * 100 + 1e-7);
 const round = (usd: number): number => Math.round(usd * 100) / 100;
 
 export function planBuyback(input: PlanInput): Plan {
+  // The last line of defence: NaN compares false with everything, and Infinity would withdraw all the free collateral.
+  for (const field of ["equityUsd", "basisUsd", "settledUsd", "freeUsd", "buybackPct", "minUsd"] as const) {
+    if (!Number.isFinite(input[field])) throw new Error(`Nothing is paid: ${field} is not a number.`);
+  }
+  if (input.settledUsd < 0) throw new Error("Nothing is paid: the amount already split is below zero.");
+  if (input.buybackPct < 0 || input.buybackPct > 100) throw new Error("Nothing is paid: the buyback share is not between 0 and 100.");
+  if (input.minUsd <= 0) throw new Error("Nothing is paid: the minimum is not above zero.");
   const profitUsd = round(input.equityUsd - input.basisUsd);
   const distributableUsd = round(Math.max(0, profitUsd - input.settledUsd));
   const wantUsd = (distributableUsd * input.buybackPct) / 100;

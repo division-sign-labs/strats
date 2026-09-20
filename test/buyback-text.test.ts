@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
+import { bridgeCalldata } from "./helpers/calldata.js";
 import { parseArgs, UsageError } from "../src/args.js";
 import { QuoteSchema, floorFrom } from "../src/buyback/lifi.js";
 import { planBuyback } from "../src/buyback/plan.js";
@@ -22,7 +23,7 @@ const quote = QuoteSchema.parse({
     gasCosts: [{ amount: "11704308000000", amountUSD: "0.03", token: { symbol: "ETH" } }],
   },
   includedSteps: [{ type: "protocol", tool: "feeCollection" }, { type: "cross", tool: "relay" }],
-  transactionRequest: { to: DIAMOND, from: WALLET, chainId: 42161, data: "0xabcdef", value: "0x0" },
+  transactionRequest: { to: DIAMOND, from: WALLET, chainId: 42161, data: bridgeCalldata({ receiver: WALLET, toChainId: 8453, fromAmount: 196_470_000n, token: TOKEN, minOut: 1192505490000000000000000n }), value: "0x0" },
 });
 const ctx = (over: Partial<RouteContext> = {}): RouteContext => ({
   botId: "strats", venueLabel: "Hyperliquid", sourceSymbol: "USDC", sourceChain: "Arbitrum", sourceChainId: 42161, nativeSymbol: "ETH", walletAddress: WALLET,
@@ -166,5 +167,18 @@ describe("strats buyback, before anything is read", () => {
     } finally {
       if (saved === undefined) delete process.env[RUNTIME_CREDS_ENV]; else process.env[RUNTIME_CREDS_ENV] = saved;
     }
+  });
+});
+
+describe("money review 0.5.1: what was not checked is said", () => {
+  it("adds one plain row to the quote and to the confirmation when the minimum is only the route's promise, or the call cannot be decoded", () => {
+    const unbound = QuoteSchema.parse({ ...quote, transactionRequest: { ...quote.transactionRequest, data: bridgeCalldata({ receiver: WALLET, toChainId: 8453, fromAmount: 196_470_000n }) } });
+    const opaque = QuoteSchema.parse({ ...quote, transactionRequest: { ...quote.transactionRequest, data: "0xabcdef" } });
+    const plan = { withdrawUsd: 197.47, feeUsd: 1, arriveUsd: 196.47 };
+    for (const [q, expected] of [[unbound, /Not checked\s+The minimum is the promise of LI\.FI's route \(relay\), not written into what you sign\./], [opaque, /Not checked\s+This transaction could not be decoded/]] as const) {
+      assert.ok(renderQuote(plan, q, ctx(), null, new Date()).some((line) => expected.test(line)));
+      assert.match(renderConfirmation(plan, q, ctx(), floorFrom(q)).at(-1)!, expected);
+    }
+    assert.equal(renderConfirmation(plan, quote, ctx(), floorFrom(quote)).some((line) => /Not checked/.test(line)), false);
   });
 });

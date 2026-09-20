@@ -4,11 +4,11 @@
 import { UsageError, type Args } from "../args.js";
 import { fileJournal } from "../buyback/journal.js";
 import { MIN_USD_DEFAULT } from "../buyback/plan.js";
-import { autoBuybackQuestion, describeAutoBuyback } from "../buyback/text.js";
+import { AUTO_BUYBACK_UNAVAILABLE, autoBuybackQuestion, describeAutoBuyback } from "../buyback/text.js";
 import { fetchConfigFor } from "../client.js";
 import { openSession, requireKeystore } from "../session.js";
 import type { Prompts } from "../setup.js";
-import { isPolymarketBot, pinnedDifferences, saveBot, sendsMasterKey, type BotState } from "../state.js";
+import { autoBuybackAvailable, isPolymarketBot, pinnedDifferences, saveBot, sendsMasterKey, type BotState } from "../state.js";
 import { chainName, describeConfig } from "./init.js";
 
 /** The address a report would carry: the Hyperliquid wallet, or a theme or team bot's Polymarket deposit wallet. */
@@ -55,6 +55,10 @@ async function autoBuyback(bot: BotState, value: string | undefined, prompts: Pr
     console.log(`Nothing was changed. Auto-buyback is ${describeAutoBuyback(bot)}.`);
     return 0;
   }
+  if (next && !autoBuybackAvailable(bot)) {
+    console.log(AUTO_BUYBACK_UNAVAILABLE);
+    return 1;
+  }
   if (!prompts.interactive) throw new UsageError(`strats config auto-buyback ${value} asks a question and needs a terminal.`);
   if (next) {
     let open = true;
@@ -68,8 +72,12 @@ async function autoBuyback(bot: BotState, value: string | undefined, prompts: Pr
       return 1;
     }
   }
+  // A droplet was given up with --force: only a person who has looked at the record may let a droplet pay again.
+  const gap = next && bot.payoutRecordIncomplete
+    ? "This machine's payout record may be missing what a lost droplet paid, and the droplet would split that profit again. First run strats buyback and check its \"Already split\" line. "
+    : "";
   const question = next
-    ? `${autoBuybackQuestion(bot)} It checks the profit once a day and buys back whenever the buyback share is at least $${MIN_USD_DEFAULT}, with the token, split and destination pinned here.`
+    ? `${gap}${autoBuybackQuestion(bot)} It checks the profit once a day and buys back whenever the buyback share is at least $${MIN_USD_DEFAULT}, with the token, split and destination pinned here.`
     : sendsMasterKey({ ...bot, autoBuyback: true })
       ? "Stop buying back automatically? The next strats deploy replaces the droplet's credentials with ones that hold no wallet key."
       : "Stop buying back automatically? Buybacks are then yours to run, with strats buyback --execute.";
@@ -78,7 +86,8 @@ async function autoBuyback(bot: BotState, value: string | undefined, prompts: Pr
     console.log("Nothing was changed.");
     return 0;
   }
-  saveBot({ ...bot, autoBuyback: next });
+  const { payoutRecordIncomplete: _gap, ...rest } = bot;
+  saveBot(next ? { ...rest, autoBuyback: true } : { ...bot, autoBuyback: false });
   console.log(next ? "Auto-buyback is on." : "Auto-buyback is off.");
   if (bot.deployment) console.log(`The droplet keeps the setting it was deployed with${bot.deployment.autoBuyback === true ? ", so it still buys back by itself" : ""}. To send it this one: strats deploy`);
   else if (next) console.log("It starts with the droplet: strats deploy");

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { LIFI_DIAMOND, QuoteSchema, checkQuote, fetchQuote, fetchStatus, floorFrom, priceImpactPct, quoteUrl, readStatus, type QuoteExpectation } from "../src/buyback/lifi.js";
+import { bridgeCalldata, swapCalldata } from "./helpers/calldata.js";
+import { UNBOUND_MINIMUM_BRIDGES, calldataNote, minimumIsBound, readCalldata, LIFI_DIAMOND, QuoteSchema, checkQuote, fetchQuote, fetchStatus, floorFrom, priceImpactPct, quoteUrl, readStatus, type QuoteExpectation } from "../src/buyback/lifi.js";
 
 const WALLET = `0x${"a1".repeat(20)}`;
 const DEST = `0x${"d2".repeat(20)}`;
@@ -184,5 +185,53 @@ describe("readStatus", () => {
     assert.equal((await fetchStatus(expectStatus, respond(404, { message: "not found", code: 1003 }))).state, "pending");
     assert.equal((await fetchStatus(expectStatus, (async () => { throw new Error("socket"); }) as unknown as typeof fetch)).state, "pending");
     assert.equal((await fetchStatus(expectStatus, respond(200, statusBody()))).state, "done");
+  });
+});
+
+describe("money review 0.5.1: the transaction that is signed", () => {
+  const MIN = 176406395059151920000000n;
+  const withData = (data: string) => quote((q) => { q.transactionRequest.data = data; });
+
+  it("is refused when its calldata pays someone else, although LI.FI's envelope still names our address", () => {
+    const tampered = withData(bridgeCalldata({ receiver: `0x${"11".repeat(20)}`, toChainId: 8453, fromAmount: 196_470_000n, token: TOKEN, minOut: MIN }));
+    assert.deepEqual(checkQuote(tampered, expect()), ["the transaction you would sign delivers to a different address"]);
+    const honest = withData(bridgeCalldata({ receiver: DEST, toChainId: 8453, fromAmount: 196_470_000n, token: TOKEN, minOut: MIN }));
+    assert.deepEqual(checkQuote(honest, expect()), []);
+  });
+
+  it("is refused when its calldata ends on another chain", () => {
+    const other = withData(bridgeCalldata({ receiver: DEST, toChainId: 10, fromAmount: 196_470_000n, token: TOKEN, minOut: MIN }));
+    assert.deepEqual(checkQuote(other, expect()), ["the transaction you would sign ends on a different chain"]);
+  });
+
+  it("same chain: the receiver and the minimum are read from the call, and a lower minimum than quoted is refused", () => {
+    const same = (data: string) => quote((q) => { q.action.toChainId = 42161; q.action.toToken.chainId = 42161; q.transactionRequest.data = data; });
+    const e = expect({ toChainId: 42161 });
+    assert.deepEqual(checkQuote(same(swapCalldata({ receiver: DEST, minOut: MIN })), e), []);
+    assert.deepEqual(checkQuote(same(swapCalldata({ receiver: DEST, minOut: MIN - 1n })), e), ["the transaction you would sign accepts less than the quote promises"]);
+    assert.deepEqual(checkQuote(same(swapCalldata({ receiver: WALLET, minOut: MIN })), e), ["the transaction you would sign delivers to a different address"]);
+    const read = readCalldata(swapCalldata({ receiver: DEST, minOut: MIN }), true);
+    assert.ok(read.decoded && read.kind === "swap" && read.receiver.toLowerCase() === DEST && read.minAmountOut === MIN);
+  });
+
+  it("unattended: refuses what cannot be decoded, and a route whose minimum is only a promise; a person is told instead", () => {
+    const unbound = withData(bridgeCalldata({ receiver: DEST, toChainId: 8453, fromAmount: 196_470_000n }));
+    assert.equal(minimumIsBound(unbound), false);
+    assert.deepEqual(checkQuote(unbound, expect()), []);
+    assert.deepEqual(checkQuote(unbound, expect({ requireBoundMinimum: true })), ["the minimum is not written into the transaction (route layerswap)"]);
+    assert.match(calldataNote(unbound)!, /The minimum is the promise of LI\.FI's route \(layerswap\), not written into what you sign\./);
+    const opaque = quote();
+    assert.deepEqual(checkQuote(opaque, expect()), []);
+    assert.deepEqual(checkQuote(opaque, expect({ requireBoundMinimum: true })), ["the transaction could not be decoded, so its recipient cannot be checked"]);
+    assert.match(calldataNote(opaque)!, /could not be decoded, so the recipient and the minimum are LI\.FI's word/);
+    const bound = withData(bridgeCalldata({ receiver: DEST, toChainId: 8453, fromAmount: 196_470_000n, token: TOKEN, minOut: MIN }));
+    assert.equal(minimumIsBound(bound), true);
+    assert.equal(calldataNote(bound), null);
+  });
+
+  it("asks LI.FI to leave out the bridges that do not write the minimum, only when told to", () => {
+    assert.equal(quoteUrl(expect()).includes("denyBridges"), false);
+    const url = quoteUrl({ ...expect(), denyBridges: UNBOUND_MINIMUM_BRIDGES });
+    for (const bridge of UNBOUND_MINIMUM_BRIDGES) assert.ok(url.includes(`denyBridges=${bridge}`));
   });
 });

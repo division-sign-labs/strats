@@ -140,7 +140,7 @@ export const moneyText = {
   onItsWay: (deps: Pick<BuybackDeps, "wallet">, j: Journal): string =>
     `The withdrawal of ${usd(j.withdrawUsd)} is on its way to your wallet ${deps.wallet.address} on ${deps.wallet.chainName}. Run strats buyback --execute again to continue.`,
   arrived: (deps: Pick<BuybackDeps, "wallet">, j: Journal): string =>
-    `${usd(unitsToUsd(BigInt(j.arriveUnits)))} ${deps.wallet.sourceSymbol} is in your wallet ${deps.wallet.address} on ${deps.wallet.chainName}. Nothing was swapped. Run strats buyback --execute again to continue, or move it yourself.`,
+    `${usd(unitsToUsd(BigInt(j.arriveUnits)))} ${deps.wallet.sourceSymbol} is in your wallet ${deps.wallet.address} on ${deps.wallet.chainName}. Nothing was swapped. Run strats buyback --execute again to continue.`,
   inFlight: (hash: string): string => `The swap is in flight (transaction ${hash}). Run strats buyback --execute again to check it.`,
 };
 
@@ -194,6 +194,20 @@ async function advance(deps: BuybackDeps, start: Journal, resumed: boolean): Pro
     recordWithdrawal();
   };
   const arrivedInWallet = async (): Promise<boolean> => (await deps.wallet.sourceBalance()) - BigInt(j.walletBalanceBeforeUnits) >= amount - ARRIVAL_TOLERANCE_UNITS;
+
+  /** The swap spends the journal's amount, so the wallet must hold it. Checked before anything is quoted, approved or signed. */
+  const moneyMissing = async (): Promise<Outcome | null> => {
+    let balance: bigint;
+    try {
+      balance = await deps.wallet.sourceBalance();
+    } catch (error) {
+      deps.print(`The wallet's balance could not be read (${message(error)}). Nothing was signed. Run strats buyback --execute again.`);
+      return { code: 3 };
+    }
+    if (balance >= amount - ARRIVAL_TOLERANCE_UNITS) return null;
+    deps.print(`The wallet ${deps.wallet.address} holds ${usd(unitsToUsd(balance))} ${deps.wallet.sourceSymbol}, less than the ${usd(unitsToUsd(amount))} this buyback swaps. Nothing was signed. Put the money back in the wallet, then run strats buyback --execute again.`);
+    return { code: 3 };
+  };
 
   /** A fresh, checked quote; shown and confirmed again when the run was resumed. Null means stop, with the code to stop with. */
   const freshQuote = async (): Promise<Quote | Outcome> => {
@@ -258,7 +272,9 @@ async function advance(deps: BuybackDeps, start: Journal, resumed: boolean): Pro
           if (error instanceof WithdrawNotSentError) {
             deps.journal.remove();
             deps.print(`The withdrawal was not sent: ${message(error)}`);
-            deps.print(moneyText.nothingLeft(deps));
+            // The last line says where the money is: strats status shows it.
+            if (error.movedToMain) deps.print(`${usd(j.withdrawUsd)} was moved from the "${j.dex ?? ""}" dex to your main Hyperliquid account and is still there. ${moneyText.nothingLeft(deps)} To move it back to the dex: strats fund`);
+            else deps.print(moneyText.nothingLeft(deps));
             return { code: error.movedToMain ? 3 : 1 };
           }
           deps.print(`The withdrawal may or may not have gone out (${message(error)}). It is not sent again.`);
@@ -272,11 +288,21 @@ async function advance(deps: BuybackDeps, start: Journal, resumed: boolean): Pro
 
       case "withdraw_sending": {
         // The result of the withdrawal is unknown. Never send it again: look for it.
-        const seen = (await arrivedInWallet()) ? "withdrawn" : await deps.venue.evidence(j);
+        // Money in the wallet is not proof: a deposit lands in the same wallet. Hyperliquid's own history decides. Polymarket has
+        // none, so only an increase of exactly the amount counts.
+        const delta = (await deps.wallet.sourceBalance()) - BigInt(j.walletBalanceBeforeUnits);
+        const evidence = await deps.venue.evidence(j);
+        const exact = delta >= amount - ARRIVAL_TOLERANCE_UNITS && delta <= amount + ARRIVAL_TOLERANCE_UNITS;
+        const seen = j.venue === "hyperliquid" ? evidence : exact ? "withdrawn" : evidence;
         if (seen === "withdrawn") {
           withdrawalConfirmed();
           deps.print("The withdrawal did go out.");
           break;
+        }
+        const unexplained = j.venue === "hyperliquid" ? delta >= amount - ARRIVAL_TOLERANCE_UNITS : delta > amount + ARRIVAL_TOLERANCE_UNITS;
+        if (unexplained) {
+          deps.print(`Your wallet received ${usd(unitsToUsd(delta))} ${deps.wallet.sourceSymbol} since this buyback started, but ${deps.venue.label} shows no withdrawal of ${usd(j.withdrawUsd)}. It is treated as a deposit: nothing is recorded or swapped. Move it on (strats fund) and run again.`);
+          return { code: 3 };
         }
         if (deps.clock.now() - Date.parse(j.startedAt) < WITHDRAW_EVIDENCE_MS) {
           deps.print("Still checking whether the withdrawal went out. Run it again in a few minutes.");
@@ -312,6 +338,8 @@ async function advance(deps: BuybackDeps, start: Journal, resumed: boolean): Pro
 
       case "arrived": {
         recordWithdrawal();
+        const missing = await moneyMissing();
+        if (missing) return missing;
         const quote = await freshQuote();
         if ("code" in quote) return quote;
         // An approval left over from a stopped run is reused. Otherwise approve exactly this payout, never more.
@@ -383,6 +411,8 @@ async function advance(deps: BuybackDeps, start: Journal, resumed: boolean): Pro
       }
 
       case "approved": {
+        const missing = await moneyMissing();
+        if (missing) return missing;
         const quote = await freshQuote();
         if ("code" in quote) return quote;
         const outcome = await signAndSendSwap(quote, undefined);

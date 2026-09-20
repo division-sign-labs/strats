@@ -7,7 +7,7 @@ import { startAutoBuyback } from "../buyback/auto.js";
 import { fetchConfig, fetchTarget } from "../client.js";
 import { runLoop, runLoops, type VenueLoop } from "../loop.js";
 import { appendLog } from "../paths.js";
-import type { ConfigDoc, TargetDoc } from "../protocol/index.js";
+import { tradesMarkets, type ConfigDoc, type TargetDoc } from "../protocol/index.js";
 import { describeDecision, holdReason, reconcile, type Decision, type ReconcileInput, type Side, type TargetInput } from "../reconcile.js";
 import { Reporter, assetLabel, hyperliquidPositions, mergeFigures, publishedWalletAddress, toReportTrade, type ReportFigures } from "../report.js";
 import { appendTrade, loadRuntimeState, saveRuntimeState } from "../runtime-state.js";
@@ -140,6 +140,7 @@ export function perpLoop(session: Session, opts: PerpLoopOptions): VenueLoop<Rep
   let configProblem = "";
   let configAt = 0;
   let warnedVersion: number | undefined;
+  let marketsNotedVersion: number | undefined;
   let forced: TargetDoc | undefined;
   let unprotectedSince: number | undefined;
   const venues = new Map<string, Venue>();
@@ -155,6 +156,10 @@ export function perpLoop(session: Session, opts: PerpLoopOptions): VenueLoop<Rep
       configAt = now;
       if (fetched.ok) {
         config = fetched.value;
+        if (tradesMarkets(config) && !isTwoVenueBot(bot) && marketsNotedVersion !== config.version) {
+          marketsNotedVersion = config.version;
+          emit("These settings trade Polymarket markets too, and this bot is set up for the perp only. To add them: strats init --force (the wallet is kept), then strats deploy");
+        }
         const differences = pinnedDifferences(bot.pinned, config.config.account);
         if (differences.length > 0 && warnedVersion !== config.version) {
           warnedVersion = config.version;

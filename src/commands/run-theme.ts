@@ -8,8 +8,9 @@ import type { Args } from "../args.js";
 import { startAutoBuyback } from "../buyback/auto.js";
 import { runLoop, type VenueLoop } from "../loop.js";
 import { appendLog } from "../paths.js";
-import { sourceFor, type PolymarketConfigDoc, type PolymarketSource } from "../polymarket-source.js";
-import type { ThemeMarket } from "../protocol/index.js";
+import { sourceFor, type CycleMarkets, type PolymarketConfigDoc, type PolymarketSource, type PolymarketTargetsDoc } from "../polymarket-source.js";
+import { managedMarketsForCycle } from "../managed-markets.js";
+import { isManaged, type ThemeMarket } from "../protocol/index.js";
 import { describeThemeDecision, reconcileTheme, themeHoldReason, type ThemeTargetsInput } from "../reconcile-theme.js";
 import { Reporter, polymarketPositions, publishedWalletAddress, toReportTrade, type ReportFigures } from "../report.js";
 import { appendTrade, loadRuntimeState, saveRuntimeState, type StateScope } from "../runtime-state.js";
@@ -19,6 +20,8 @@ import { PolymarketVenue, polymarketGeoblock, type PmActionResult, type Polymark
 
 const CONFIG_REFRESH_MS = 5 * 60_000;
 const GEOBLOCK_RECHECK_MS = 15 * 60_000;
+/** A two-venue bot's Polymarket figures older than this are read again before they join a report. */
+const STALE_SNAPSHOT_MS = 10 * 60_000;
 /** After an order whose result is unknown, the same market is left alone this long. */
 const UNCERTAIN_COOLDOWN_MS = 15 * 60_000;
 
@@ -83,6 +86,31 @@ export async function assetMarketsLoop(session: Session, opts: { dryRun: boolean
   }
 }
 
+/**
+ * The markets this cycle may trade, and the wallet read against them. A managed key names no markets, so each market the document
+ * names is confirmed on Polymarket itself first, and so is the market of anything the wallet holds: the list may have dropped it
+ * since, and its closure must still be acted on.
+ */
+export async function readCycle(source: PolymarketSource, config: PolymarketConfigDoc | undefined, doc: PolymarketTargetsDoc, venue: Pick<PolymarketVenue, "snapshot" | "marketFacts">): Promise<{ allowed: CycleMarkets; snap: PolymarketSnapshot; refused: string[] }> {
+  if (!isManaged(config)) {
+    const allowed = source.marketsFor(config, doc);
+    return { allowed, snap: await venue.snapshot(allowed.markets, allowed.quoteTokenIds), refused: allowed.refused };
+  }
+  const facts = await venue.marketFacts(doc.targets.map((t) => t.tokenId));
+  let confirmed = managedMarketsForCycle(doc, facts);
+  let allowed = source.marketsFor(config, doc, confirmed.markets);
+  let snap = await venue.snapshot(allowed.markets, allowed.quoteTokenIds);
+  const known = new Set(allowed.markets.flatMap((m) => m.tokenIds));
+  const unknownHeld = snap.holdings.map((h) => h.tokenId).filter((tokenId) => !known.has(tokenId));
+  if (unknownHeld.length > 0) {
+    for (const [tokenId, fact] of await venue.marketFacts(unknownHeld)) facts.set(tokenId, fact);
+    confirmed = managedMarketsForCycle(doc, facts, unknownHeld);
+    allowed = source.marketsFor(config, doc, confirmed.markets);
+    snap = await venue.snapshot(allowed.markets, allowed.quoteTokenIds);
+  }
+  return { allowed, snap, refused: [...confirmed.refused, ...allowed.refused] };
+}
+
 export interface MarketsLoopOptions {
   source: PolymarketSource;
   venue: PolymarketVenue;
@@ -109,6 +137,7 @@ export function marketsLoop(session: Session, opts: MarketsLoopOptions): VenueLo
   let blockedAt = 0;
   let blocked = false;
   let lastSnap: PolymarketSnapshot | undefined;
+  let lastSnapAt = 0;
   /** The markets of the last cycle that read the targets, for the report. */
   let lastMarkets: ThemeMarket[] = [];
   let lastAction = "";
@@ -147,16 +176,17 @@ export function marketsLoop(session: Session, opts: MarketsLoopOptions): VenueLo
     // HOLD needs no venue read: nothing is opened and nothing is closed.
     const hold = (held: ThemeTargetsInput): string => `${tag}  ${describeThemeDecision(reconcileTheme({ ...EMPTY, targets: held, now }), dryRun)}`;
     if (!fetched.ok) return hold({ ok: false, reason: fetched.message });
+    // HOLD before anything else is read, as for every other key.
+    const asTheme: ThemeTargetsInput & { ok: true } = { ok: true, doc: { ...fetched.value, strategyId: "theme" } };
+    if (themeHoldReason(asTheme, now) !== null) return hold(asTheme);
     // A team bot checks each game against the settings here. A game that fails is left out, so its target is refused below.
-    const allowed = source.marketsFor(config, fetched.value);
+    const { allowed, snap, refused } = await readCycle(source, config, fetched.value, venue);
     const targets: ThemeTargetsInput & { ok: true } = { ok: true, doc: allowed.doc };
-    if (themeHoldReason(targets, now) !== null) return hold(targets);
-
     const { markets } = allowed;
     lastMarkets = markets;
-    const refusals = allowed.refused.length > 0 ? ` ${allowed.refused.slice(0, 3).join(" ")}` : "";
-    const snap = await venue.snapshot(markets, allowed.quoteTokenIds);
+    const refusals = refused.length > 0 ? ` ${refused.slice(0, 3).join(" ")}` : "";
     lastSnap = snap;
+    lastSnapAt = Date.now();
     if (tradedSinceSnapshot) {
       // This snapshot shows the position the last order made, so the report that follows this cycle is sent early.
       tradedSinceSnapshot = false;
@@ -179,6 +209,7 @@ export function marketsLoop(session: Session, opts: MarketsLoopOptions): VenueLo
       blockedTargetIds: [...Object.keys(state.entered), ...recentlyAttempted],
       redeemedConditionIds: Object.keys(state.redeemed),
       pendingTokenIds: snap.pendingTokenIds,
+      ...(source.entryRule ? { entryRule: source.entryRule } : {}),
       ...(config ? {} : { openBlockedReason: `The settings could not be loaded (${configProblem}) Not opening.` }),
     });
     if (dryRun || decision.actions.length === 0) return `${tag}  ${describeThemeDecision(decision, dryRun)}${refusals}`;
@@ -233,6 +264,16 @@ export function marketsLoop(session: Session, opts: MarketsLoopOptions): VenueLo
     if (!lastSnap && opts.readWhenIdle === true) {
       if (lastMarkets.length === 0 && config && "markets" in config.config.strategy) lastMarkets = config.config.strategy.markets ?? [];
       lastSnap = await venue.snapshot(lastMarkets, []);
+      lastSnapAt = Date.now();
+    } else if (lastSnap && opts.readWhenIdle === true && Date.now() - lastSnapAt > STALE_SNAPSHOT_MS) {
+      // The markets side has held for a while (no targets, a fault on the server), and the perp's figures are read fresh for every
+      // report. An old wallet value is not added to a new one: it is read again, and when that fails nothing is sent.
+      try {
+        lastSnap = await venue.snapshot(lastMarkets, []);
+        lastSnapAt = Date.now();
+      } catch {
+        return null;
+      }
     }
     if (!lastSnap) return null;
     const state = loadRuntimeState(bot.id, scope);

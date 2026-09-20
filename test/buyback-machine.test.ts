@@ -284,7 +284,6 @@ describe("the withdrawal", () => {
     const w = world(journalAt("withdraw_sending", { venue: "polymarket", dex: undefined }));
     w.deps.wallet.sourceBalance = async () => 5_000_000n + A;
     assert.deepEqual(await resumePayout(w.deps, w.journal()!), { code: 0 });
-    assert.equal(w.events.includes("evidence"), false);
     assert.equal(w.ledger.filter((l) => l.type === "withdrawal").length, 1);
   });
 
@@ -344,6 +343,7 @@ describe("running it again", () => {
 
   it("with the money in the wallet shows the new quote and asks again; no means nothing is signed", async () => {
     const w = world(journalAt("arrived"));
+    w.deps.wallet.sourceBalance = async () => 5_000_000n + A;
     w.knobs.confirm = false;
     assert.deepEqual(await resumePayout(w.deps, w.journal()!), { code: 0 });
     assert.ok(w.events.includes(`quote:${A}:no-floor`));
@@ -351,11 +351,12 @@ describe("running it again", () => {
     assert.equal(w.events.some((e) => e.startsWith("sign-") || e.startsWith("broadcast")), false);
     assert.equal(w.journal()?.stage, "arrived");
     assert.ok(w.printed.includes("Route") && w.printed.includes("Nothing was changed."));
-    assert.equal(w.printed.at(-1), `$196.47 USDC is in your wallet ${WALLET} on Arbitrum. Nothing was swapped. Run strats buyback --execute again to continue, or move it yourself.`);
+    assert.equal(w.printed.at(-1), `$196.47 USDC is in your wallet ${WALLET} on Arbitrum. Nothing was swapped. Run strats buyback --execute again to continue.`);
   });
 
   it("with the money in the wallet and a yes measures the floor from the quote that was shown, saves it, and finishes", async () => {
     const w = world(journalAt("arrived"));
+    w.deps.wallet.sourceBalance = async () => 5_000_000n + A;
     const cheaper = quoteOf(MIN_OUT / 2n);
     w.knobs.quotes = [cheaper];
     assert.deepEqual(await resumePayout(w.deps, w.journal()!), { code: 0 });
@@ -548,5 +549,71 @@ describe("tokenAmount", () => {
     assert.equal(tokenAmount("1500000000000000000", 18), "1.5");
     assert.equal(tokenAmount("123456", 6), "0.1234");
     assert.equal(tokenAmount("0", 18), "0");
+  });
+});
+
+describe("money review 0.5.1: a deposit is never taken for the withdrawal", () => {
+  it("Hyperliquid, result unknown, a deposit lands: the venue shows no withdrawal, so nothing is recorded or swapped, and the journal is kept", async () => {
+    const w = world(journalAt("withdraw_sending"));
+    w.deps.wallet.sourceBalance = async () => 5_000_000n + 250_000_000n;
+    assert.deepEqual(await resumePayout(w.deps, w.journal()!), { code: 3 });
+    assert.deepEqual(w.ledger, []);
+    assert.equal(w.journal()?.stage, "withdraw_sending");
+    assert.equal(w.events.some((e) => e.startsWith("sign-")), false);
+    assert.match(w.printed.at(-1)!, /treated as a deposit: nothing is recorded or swapped/);
+  });
+
+  it("keeps that journal even after the 30 minutes, instead of declaring the withdrawal never happened", async () => {
+    const w = world(journalAt("withdraw_sending", { startedAt: new Date(T0 - WITHDRAW_EVIDENCE_MS - 1).toISOString() }));
+    w.deps.wallet.sourceBalance = async () => 5_000_000n + 250_000_000n;
+    assert.deepEqual(await resumePayout(w.deps, w.journal()!), { code: 3 });
+    assert.equal(w.journal()?.stage, "withdraw_sending");
+    assert.deepEqual(w.ledger, []);
+  });
+
+  it("Polymarket: an increase of more than the amount is not proof, and is not 'never happened' either", async () => {
+    const w = world(journalAt("withdraw_sending", { venue: "polymarket", dex: undefined, startedAt: new Date(T0 - WITHDRAW_EVIDENCE_MS - 1).toISOString() }));
+    w.deps.wallet.sourceBalance = async () => 5_000_000n + A + 50_000_000n;
+    assert.deepEqual(await resumePayout(w.deps, w.journal()!), { code: 3 });
+    assert.equal(w.journal()?.stage, "withdraw_sending");
+    assert.deepEqual(w.ledger, []);
+  });
+
+  it("Hyperliquid's own history confirms at once, before the wallet is credited: the line is written and the run waits", async () => {
+    const w = world(journalAt("withdraw_sending"));
+    w.knobs.evidence = "withdrawn";
+    w.deps.wallet.sourceBalance = async () => 5_000_000n;
+    assert.deepEqual(await resumePayout(w.deps, w.journal()!), { code: 3 });
+    assert.equal(w.ledger.filter((l) => l.type === "withdrawal").length, 1);
+    assert.equal(w.journal()?.stage, "withdraw_sent");
+  });
+});
+
+describe("money review 0.5.1: a buyback whose money is gone signs nothing", () => {
+  it("at arrived, with the wallet short of the amount: no quote, no approval, no swap, exit 3 and a true sentence", async () => {
+    const w = world(journalAt("arrived"));
+    w.deps.wallet.sourceBalance = async () => 5_000_000n;
+    assert.deepEqual(await resumePayout(w.deps, w.journal()!), { code: 3 });
+    assert.equal(w.events.some((e) => e.startsWith("quote:") || e.startsWith("sign-") || e.startsWith("broadcast")), false);
+    assert.equal(w.journal()?.stage, "arrived");
+    assert.match(w.printed.at(-1)!, /holds \$5\.00 USDC, less than the \$196\.47 this buyback swaps\. Nothing was signed\./);
+  });
+
+  it("at approved too, before the swap is signed", async () => {
+    const w = world(journalAt("approved"));
+    w.deps.wallet.sourceBalance = async () => 0n;
+    assert.deepEqual(await resumePayout(w.deps, w.journal()!), { code: 3 });
+    assert.equal(w.events.some((e) => e.startsWith("sign-")), false);
+  });
+});
+
+describe("money review 0.5.1: HIP-3 money left in the main account", () => {
+  it("is said when the withdrawal is refused after the move, as the last line, with exit 3", async () => {
+    const w = world();
+    w.knobs.withdraw = async () => { throw new WithdrawNotSentError("insufficient withdrawable balance", true); };
+    assert.deepEqual(await startPayout(w.deps, params()), { code: 3 });
+    assert.equal(w.journal(), null);
+    assert.deepEqual(w.ledger, []);
+    assert.match(w.printed.at(-1)!, /was moved from the ".*" dex to your main Hyperliquid account and is still there\. Nothing left Hyperliquid\. To move it back to the dex: strats fund/);
   });
 });

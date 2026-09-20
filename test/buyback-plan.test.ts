@@ -127,3 +127,19 @@ describe("deposits less withdrawals, for Polymarket", () => {
     assert.equal(depositsLessWithdrawals(1000, "not a date", withdrawals), 850);
   });
 });
+
+describe("money review 0.5.1: planBuyback refuses figures that are not numbers", () => {
+  it("throws a plain sentence for NaN or an infinity on any figure, and never returns a plan that could pay", () => {
+    for (const field of ["equityUsd", "basisUsd", "settledUsd", "freeUsd", "buybackPct", "minUsd"] as const) {
+      for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+        assert.throws(() => planBuyback(input({ [field]: bad })), /^Error: Nothing is paid: /, `${field} ${bad}`);
+      }
+    }
+  });
+
+  it("refuses a negative settled figure, a share outside 0 to 100, and a minimum that is not above zero", () => {
+    assert.throws(() => planBuyback(input({ settledUsd: -1 })), /Nothing is paid/);
+    assert.throws(() => planBuyback(input({ buybackPct: 101 })), /Nothing is paid/);
+    assert.throws(() => planBuyback(input({ minUsd: 0 })), /Nothing is paid/);
+  });
+});

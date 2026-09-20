@@ -2,7 +2,7 @@
 // and the quote, so the exact words are tested. Amounts of money use usd().
 import { usd } from "../reconcile.js";
 import { sendsMasterKey, type BotState } from "../state.js";
-import { LIFI_DIAMOND, priceImpactPct, type Quote } from "./lifi.js";
+import { LIFI_DIAMOND, calldataNote, priceImpactPct, type Quote } from "./lifi.js";
 import { tokenAmount } from "./machine.js";
 import { MIN_USD_DEFAULT, type Plan } from "./plan.js";
 
@@ -125,6 +125,8 @@ export function renderQuote(plan: Pick<Plan, "feeUsd">, quote: Quote, ctx: Route
   const { toToken } = quote.action;
   const impact = priceImpactPct(quote);
   const time = at.toTimeString().slice(0, 8);
+  // Said plainly whenever the recipient or the minimum is LI.FI's word and not in the transaction that is signed.
+  const note = calldataNote(quote);
   return [
     `Quote, live at ${time}`,
     line("You receive about", `${tokenAmount(quote.estimate.toAmount, toToken.decimals)} ${toToken.symbol} (${usd(money(quote.estimate.toAmountUSD))})`),
@@ -134,6 +136,7 @@ export function renderQuote(plan: Pick<Plan, "feeUsd">, quote: Quote, ctx: Route
     ...(gas ? [line("Gas", gas.enough
       ? `the wallet holds ${gas.heldText} ${ctx.nativeSymbol} on ${ctx.sourceChain}, enough`
       : `the wallet holds ${gas.heldText} ${ctx.nativeSymbol} on ${ctx.sourceChain}, not enough: send about ${gas.shortfallText} ${ctx.nativeSymbol} on ${ctx.sourceChain} to ${ctx.walletAddress} first`)] : []),
+    ...(note ? [line("Not checked", note)] : []),
     "",
   ];
 }
@@ -152,6 +155,8 @@ export function renderConfirmation(plan: Pick<Plan, "withdrawUsd" | "feeUsd" | "
       : `${tokenAmount(floorMinOut, toToken.decimals)} ${toToken.symbol}. The price is checked again just before the swap is signed; if it promises less, the swap is not sent and the ${ctx.sourceSymbol} stays in your wallet.`],
     ["Fees", [...(withWithdrawal ? feeParts(plan, quote, ctx, "") : feeParts({ feeUsd: 0 }, quote, ctx, "")), `gas about ${usd(gasUsd(quote))}`].join("; ")],
   ];
+  const note = calldataNote(quote);
+  if (note) rows.push(["Not checked", note]);
   return ["This moves real money.", ...rows.map(([label, value]) => `  ${label.padEnd(12)}${value}`)];
 }
 
@@ -167,6 +172,9 @@ export function autoBuybackQuestion(bot: Pick<BotState, "strategyId">): string {
     ? "Buy back automatically? This puts your wallet key on your droplet, so the droplet can withdraw."
     : "Buy back automatically? Your droplet already holds this bot's wallet key, so nothing more is sent to it.";
 }
+
+/** Why a theme or team bot is never offered auto-buyback. Polymarket has no deposit history, so a droplet cannot tell a deposit from profit. */
+export const AUTO_BUYBACK_UNAVAILABLE = "Auto-buyback is not offered for this bot: Polymarket shows no deposit history, so money you add could be paid out as profit with nobody asked. Buybacks are yours to run, with strats buyback --execute.";
 
 export function describeAutoBuyback(bot: Pick<BotState, "autoBuyback" | "deployment">): string {
   const setting = bot.autoBuyback === true

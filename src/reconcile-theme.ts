@@ -64,6 +64,11 @@ export interface ThemeReconcileInput {
   pendingTokenIds: string[];
   /** A reason nothing may be opened right now. Sells and redemptions still run. */
   openBlockedReason?: string;
+  /**
+   * Single-asset markets only: the rule's floor and edge, held against the live book at the moment of the order. The targets document
+   * is up to five minutes old, and a price that has fallen under the floor since is news the forecast has not seen.
+   */
+  entryRule?: { minBuyPrice: number; minEdge: number };
 }
 
 export type ThemeAction =
@@ -181,6 +186,11 @@ export function reconcileTheme(input: ThemeReconcileInput): ThemeDecision {
     const quote = input.quotes[target.tokenId];
     if (!quote || quote.ask <= 0) { notes.push(`${label}: no ask to buy from.`); continue; }
     if (quote.ask > target.maxPrice) { notes.push(`${label}: the ask ${quote.ask} is above the limit ${target.maxPrice}.`); continue; }
+    if (input.entryRule) {
+      const { minBuyPrice, minEdge } = input.entryRule;
+      if (quote.ask < minBuyPrice - 1e-9) { notes.push(`${label}: the ask ${quote.ask} is under the ${minBuyPrice} floor.`); continue; }
+      if (target.q === null || target.q - quote.ask < minEdge - 1e-9) { notes.push(`${label}: Q is not ${Math.round(minEdge * 100)} points above the ask ${quote.ask}.`); continue; }
+    }
     if (quote.ask >= target.takeProfitPrice) { notes.push(`${label}: the ask ${quote.ask} is already at the take-profit price.`); continue; }
 
     const limitPx = Math.min(quote.ask, target.maxPrice);

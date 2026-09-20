@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
 import { KeyRoles, Keystore, addressFromPk } from "@quotient-forecasting/cassie-core";
-import { AUTO_EVERY_MS, AUTO_FIRST_MS, AUTO_SETTINGS, AutoBuybackRefused, assertUnattendedAllowed, runUnattended, scheduleChecks, startAutoBuyback, type AutoPorts, type AutoTimers } from "../src/buyback/auto.js";
+import { AUTO_EVERY_MS, AUTO_FIRST_MS, AUTO_SETTINGS, AutoBuybackRefused, assertUnattendedAllowed, firstCheckDelay, runUnattended, scheduleChecks, startAutoBuyback, type AutoPorts, type AutoTimers } from "../src/buyback/auto.js";
 import { BasisSchema, buildBasis, loadBasis, mergeBasisLedger, saveBasis, type BuybackBasis } from "../src/buyback/basis.js";
 import { lastBuybackLine, pullRecord, pushBasis, type Exec } from "../src/buyback/droplet.js";
 import { JournalSchema, fileJournal, type Journal, type Stage } from "../src/buyback/journal.js";
@@ -24,7 +24,8 @@ import { withPayouts } from "../src/report.js";
 import { buildRuntimeCreds, decodeRuntimeCreds, encodeRuntimeCreds, type RuntimeCredsDoc } from "../src/runtime-creds.js";
 import { saveRuntimeState, emptyRuntimeState } from "../src/runtime-state.js";
 import { loadWalletKey, sessionSecrets, type KeystoreSession, type Session } from "../src/session.js";
-import { API_KEY_ROLE, BotStateSchema, dropletBuysBack, sendsMasterKey, type BotState } from "../src/state.js";
+import { API_KEY_ROLE, BotStateSchema, dropletBuysBack, sendsMasterKey, withoutDropletRecord, type BotState } from "../src/state.js";
+import { bridgeCalldata } from "./helpers/calldata.js";
 
 // Built at run time so no key-shaped literal sits in the repository.
 const hexKey = (byte: string): string => `0x${byte.repeat(32)}`;
@@ -62,7 +63,7 @@ const runtimeFor = (bot: BotState): RuntimeCredsDoc => buildRuntimeCreds({
 const dropletSession = (bot: BotState): Session => ({ bot, runtime: runtimeFor(bot), gateway: { gatewayUrl: bot.gatewayUrl, apiKey: API_KEY } });
 
 /** A quote that passes every check for `request`, unless a knob says otherwise. */
-const quoteFor = (request: QuoteRequest, over: { impactPct?: number; minOut?: bigint; to?: string } = {}): Quote => {
+const quoteFor = (request: QuoteRequest, over: { impactPct?: number; minOut?: bigint; to?: string; data?: string } = {}): Quote => {
   const usdIn = Number(request.fromAmount) / 1e6;
   const minOut = over.minOut ?? 1_000_000n * 10n ** 18n;
   return QuoteSchema.parse({
@@ -75,7 +76,7 @@ const quoteFor = (request: QuoteRequest, over: { impactPct?: number; minOut?: bi
     },
     estimate: { approvalAddress: DIAMOND, toAmount: (minOut + 10n ** 18n).toString(), toAmountMin: minOut.toString(), fromAmountUSD: usdIn.toFixed(2), toAmountUSD: (usdIn * (1 - (over.impactPct ?? 1) / 100)).toFixed(2), executionDuration: 11, feeCosts: [], gasCosts: [{ amount: "1000", amountUSD: "0.01", token: { symbol: "ETH" } }] },
     includedSteps: [{ type: "cross", tool: "relay" }],
-    transactionRequest: { to: DIAMOND, from: request.fromAddress, chainId: request.fromChainId, data: "0xabcdef", value: "0x0" },
+    transactionRequest: { to: DIAMOND, from: request.fromAddress, chainId: request.fromChainId, data: over.data ?? bridgeCalldata({ receiver: over.to ?? request.toAddress, toChainId: request.toChainId, fromAmount: request.fromAmount, token: request.toToken, minOut }), value: "0x0" },
   });
 };
 
@@ -110,7 +111,7 @@ function world(start: Journal | null = null): World {
   const hashes = new Map<string, string>();
   const wallet = { balance: 5_000_000n, allowance: 0n, mined: 7 };
   const knobs: World["knobs"] = {
-    figures: { equityUsd: 1500, basisUsd: 1000, freeUsd: 800 },
+    figures: { equityUsd: 2500, basisUsd: 2000, freeUsd: 800 },
     basis: BasisSchema.parse({ v: 1, at: new Date(T0).toISOString(), ledger: [] }),
     quote: (request) => quoteFor(request),
     gasHeld: 10n ** 18n,
@@ -725,5 +726,76 @@ describe("the payout record between the two machines", () => {
     assert.match(lastBuybackLine(bot, exec), /buyback {2}Bought 1,000,000 TKN/);
     assert.match(asked, /journalctl -u strats@alpha --since '3 days ago' .*grep -F ' {2}buyback {2}' \| tail -n 1$/);
     assert.equal(lastBuybackLine(baseBot(), exec), "");
+  });
+});
+
+describe("money review 0.5.1: what the unattended buyback now refuses", () => {
+  const session = dropletSession(baseBot({ autoBuyback: true }));
+
+  it("a theme or team bot, whatever its bot file says: its profit is measured from a deposits figure a droplet cannot check", async () => {
+    const bot = themeBot({ autoBuyback: true });
+    const w = world();
+    await assert.rejects(() => runUnattended(dropletSession(bot), w.ports), AutoBuybackRefused);
+    assert.deepEqual(w.events, []);
+    assert.equal(sendsMasterKey(bot), false);
+  });
+
+  it("a bot whose payout record was given up with --force", async () => {
+    const w = world();
+    const bot = baseBot({ autoBuyback: true, payoutRecordIncomplete: { at: new Date(T0).toISOString() } });
+    await assert.rejects(() => runUnattended(dropletSession(bot), w.ports), AutoBuybackRefused);
+    assert.deepEqual(w.events, []);
+  });
+
+  it("more than 25% of the account value in one check: one line, nothing paid", async () => {
+    const w = world();
+    // The shape of a $2,000 deposit read as profit: $3,000 now against a $1,000 basis.
+    w.knobs.figures = { equityUsd: 3000, basisUsd: 1000, freeUsd: 3000 };
+    assert.equal(await runUnattended(session, w.ports), null);
+    assert.equal(moneyMoved(w), false);
+    assert.equal(w.requests.length, 0);
+    assert.match(w.said.at(-1)!, /^Nothing is paid: the profit to split, \$2,000\.00, is more than 25% of the account's \$3,000\.00/);
+  });
+
+  it("figures that are not numbers: Infinity would have withdrawn all the free collateral", async () => {
+    for (const equityUsd of [Number.POSITIVE_INFINITY, Number.NaN]) {
+      const w = world();
+      w.knobs.figures = { equityUsd, basisUsd: 1000, freeUsd: 800 };
+      assert.equal(await runUnattended(session, w.ports), null);
+      assert.equal(moneyMoved(w), false);
+      assert.match(w.said.at(-1)!, /^Nothing is paid: The venue's figures could not be read/);
+    }
+  });
+
+  it("a route whose signed transaction does not carry the minimum, or cannot be decoded; and it asks LI.FI to leave those bridges out", async () => {
+    for (const [data, expected] of [[bridgeCalldata({ receiver: baseBot().masterAddress, toChainId: 8453, fromAmount: 1n }), /minimum is not written into the transaction/], ["0xabcdef", /could not be decoded/]] as const) {
+      const w = world();
+      w.knobs.quote = (r) => quoteFor(r, { data });
+      assert.equal(await runUnattended(session, w.ports), null);
+      assert.equal(moneyMoved(w), false);
+      assert.match(w.said.at(-1)!, expected);
+      assert.deepEqual(w.requests[0]!.denyBridges, ["layerswap", "relaydepository", "relay", "near"]);
+    }
+  });
+});
+
+describe("money review 0.5.1: once a day survives a restart", () => {
+  it("waits out the rest of the day since the last check, and 10 minutes when a buyback is part-way or nothing is known", () => {
+    const hour = 3_600_000;
+    assert.equal(firstCheckDelay(null, T0, false), AUTO_FIRST_MS);
+    assert.equal(firstCheckDelay(T0 - 2 * hour, T0, false), 22 * hour);
+    assert.equal(firstCheckDelay(T0 - 2 * hour, T0, true), AUTO_FIRST_MS);
+    assert.equal(firstCheckDelay(T0 - 30 * hour, T0, false), AUTO_FIRST_MS);
+    assert.equal(firstCheckDelay(T0 + hour, T0, false), AUTO_FIRST_MS);
+  });
+});
+
+describe("money review 0.5.1: a droplet's record given up with --force", () => {
+  it("turns auto-buyback off and remembers the gap, so the deploy that follows sends no wallet key", () => {
+    const bot = withoutDropletRecord(baseBot({ autoBuyback: true, deployment: { ...DEPLOYMENT, autoBuyback: true } }), new Date(T0).toISOString());
+    assert.equal(bot.autoBuyback, false);
+    assert.deepEqual(bot.payoutRecordIncomplete, { at: new Date(T0).toISOString() });
+    assert.equal(sendsMasterKey(bot), false);
+    assert.doesNotThrow(() => BotStateSchema.parse(bot));
   });
 });

@@ -17,6 +17,15 @@ import { WithdrawNotSentError, type VenuePort } from "./machine.js";
 /** Said instead of a plan, with exit code 1. */
 export class BuybackRefusal extends Error {}
 
+/** The venue's figures, refused unless every one is a number: NaN or Infinity must never reach the arithmetic. */
+export async function checkedFigures(venue: Pick<BuybackVenuePort, "figures">, payouts: PayoutSummary): Promise<VenueFigures> {
+  const figures = await venue.figures(payouts);
+  if (![figures.equityUsd, figures.freeUsd, figures.basisUsd].every(Number.isFinite)) {
+    throw new BuybackRefusal("The venue's figures could not be read (wallet value, free collateral or deposits was not a number). Try again.");
+  }
+  return figures;
+}
+
 export interface VenueFigures {
   equityUsd: number;
   /** Deposits less withdrawals. */
@@ -103,19 +112,29 @@ export function hyperliquidVenue(session: Session, dex: string, prompts?: Prompt
         } catch (error) {
           throw new WithdrawNotSentError(message(error));
         }
-        try {
-          await new ExchangeClient({ transport, wallet: privateKeyToAccount(masterPk as `0x${string}`) })
-            .sendAsset({ destination: user, sourceDex: dex, destinationDex: "", token, amount: amount.toFixed(2), fromSubAccount: "" });
-        } catch (error) {
-          if (venueRefused(error)) throw new WithdrawNotSentError(message(error));
-          throw error;
-        }
-        moved = true;
-        // The main account shows the money within a moment. Withdrawing before it does would be refused.
-        for (let attempt = 0; attempt < 15; attempt++) {
+        const inMain = async (): Promise<boolean> => {
           const main = await info.clearinghouseState({ user }).catch(() => null);
-          if (main && Number(main.withdrawable) + 0.005 >= amount) break;
-          await new Promise((resolve) => setTimeout(resolve, 2_000));
+          return main !== null && Number(main.withdrawable) + 0.005 >= amount;
+        };
+        // An earlier run may have moved the money and then been refused. It is withdrawn from there, never moved a second time.
+        if (await inMain()) {
+          moved = true;
+        } else {
+          try {
+            await new ExchangeClient({ transport, wallet: privateKeyToAccount(masterPk as `0x${string}`) })
+              .sendAsset({ destination: user, sourceDex: dex, destinationDex: "", token, amount: amount.toFixed(2), fromSubAccount: "" });
+          } catch (error) {
+            if (venueRefused(error)) throw new WithdrawNotSentError(message(error));
+            throw error;
+          }
+          moved = true;
+          // The main account shows the money within a moment. Withdrawing before it does would be refused.
+          let shown = false;
+          for (let attempt = 0; attempt < 15 && !shown; attempt++) {
+            shown = await inMain();
+            if (!shown) await new Promise((resolve) => setTimeout(resolve, 2_000));
+          }
+          if (!shown) throw new WithdrawNotSentError("the main Hyperliquid account did not show the money yet", true);
         }
       }
       try {

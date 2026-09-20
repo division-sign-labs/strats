@@ -65,8 +65,10 @@ export const ConfigDocSchema = z.object({
     strategy: z.object({
       assetKey: z.string().min(1),
       direction: z.enum(["both", "long", "short"]).optional(),
-      /** The asset's Polymarket markets, chosen on TokenStrats. Absent or empty means the bot trades the perp only. */
+      /** Legacy keys: the asset's Polymarket markets, chosen on TokenStrats. Absent or empty, with no universe, means the bot trades the perp only. */
       markets: z.array(ThemeMarketSchema).max(MAX_CONFIGURED_MARKETS).optional(),
+      /** "managed": the server chooses the asset's Polymarket markets, adds new ones and drops ended ones. `markets` is then absent. */
+      universe: z.literal("managed").optional(),
     }),
     account: AccountSchema,
     profile: optionalProfile,
@@ -80,7 +82,12 @@ export const ThemeConfigDocSchema = z.object({
   config: z.object({
     v: z.literal(PROTOCOL_VERSION),
     strategyId: z.literal(THEME_STRATEGY_ID),
-    strategy: z.object({ thesis: z.string().min(3).max(600), markets: z.array(ThemeMarketSchema).min(1).max(MAX_CONFIGURED_MARKETS) }),
+    /** Either `universe: "managed"`, where the server chooses the markets that fit the theme, or a legacy list the creator chose. Never both. */
+    strategy: z.object({
+      thesis: z.string().min(3).max(600),
+      markets: z.array(ThemeMarketSchema).min(1).max(MAX_CONFIGURED_MARKETS).optional(),
+      universe: z.literal("managed").optional(),
+    }),
     account: AccountSchema,
     profile: optionalProfile,
   }),
@@ -312,19 +319,36 @@ function configuredMarketsProblem(markets: readonly ThemeMarket[]): string | nul
 export function parseConfig(input: unknown): ParseResult<ConfigDoc> {
   const parsed = ConfigDocSchema.safeParse(input);
   if (!parsed.success) return { ok: false, reason: describe(parsed.error) };
-  const problem = configuredMarketsProblem(parsed.data.config.strategy.markets ?? []);
+  const { strategy } = parsed.data.config;
+  if (strategy.universe === "managed" && strategy.markets !== undefined) return { ok: false, reason: MANAGED_WITH_MARKETS };
+  const problem = configuredMarketsProblem(strategy.markets ?? []);
   return problem === null ? { ok: true, value: parsed.data } : { ok: false, reason: problem };
 }
 
-/** The Polymarket markets of a single-asset config. Empty for a perp-only key. */
+const MANAGED_WITH_MARKETS = "the settings name both a managed universe and a list of markets";
+
+/** The Polymarket markets of a legacy single-asset config. Empty for a perp-only key and for a managed one. */
 export function configuredMarkets(doc: ConfigDoc): ThemeMarket[] {
   return doc.config.strategy.markets ?? [];
+}
+
+/** True when the server chooses the key's markets. The runner then trades any market a valid targets document names. */
+export function isManaged(doc: { config: { strategy: object } } | undefined): boolean {
+  return doc !== undefined && "universe" in doc.config.strategy && doc.config.strategy.universe === "managed";
+}
+
+/** A single-asset key trades two venues when its markets are managed or it lists some. */
+export function tradesMarkets(doc: ConfigDoc): boolean {
+  return isManaged(doc) || configuredMarkets(doc).length > 0;
 }
 
 export function parseThemeConfig(input: unknown): ParseResult<ThemeConfigDoc> {
   const parsed = ThemeConfigDocSchema.safeParse(input);
   if (!parsed.success) return { ok: false, reason: describe(parsed.error) };
-  const problem = configuredMarketsProblem(parsed.data.config.strategy.markets);
+  const { strategy } = parsed.data.config;
+  if (strategy.universe === "managed" && strategy.markets !== undefined) return { ok: false, reason: MANAGED_WITH_MARKETS };
+  if (strategy.universe === undefined && strategy.markets === undefined) return { ok: false, reason: "the settings name no markets" };
+  const problem = configuredMarketsProblem(strategy.markets ?? []);
   return problem === null ? { ok: true, value: parsed.data } : { ok: false, reason: problem };
 }
 
